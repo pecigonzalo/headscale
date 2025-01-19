@@ -7,7 +7,7 @@ import (
 )
 
 // This file is intended to "test the test framework", by proxy it will also test
-// some Headcsale/Tailscale stuff, but mostly in very simple ways.
+// some Headscale/Tailscale stuff, but mostly in very simple ways.
 
 func IntegrationSkip(t *testing.T) {
 	t.Helper()
@@ -33,9 +33,9 @@ func TestHeadscale(t *testing.T) {
 
 	user := "test-space"
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	t.Run("start-headscale", func(t *testing.T) {
 		headscale, err := scenario.Headscale()
@@ -78,9 +78,9 @@ func TestCreateTailscale(t *testing.T) {
 
 	user := "only-create-containers"
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	scenario.users[user] = &User{
 		Clients: make(map[string]TailscaleClient),
@@ -114,9 +114,9 @@ func TestTailscaleNodesJoiningHeadcale(t *testing.T) {
 
 	count := 1
 
-	scenario, err := NewScenario()
+	scenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	t.Run("start-headscale", func(t *testing.T) {
 		headscale, err := scenario.Headscale()
@@ -142,7 +142,7 @@ func TestTailscaleNodesJoiningHeadcale(t *testing.T) {
 	})
 
 	t.Run("create-tailscale", func(t *testing.T) {
-		err := scenario.CreateTailscaleNodesInUser(user, "1.30.2", count)
+		err := scenario.CreateTailscaleNodesInUser(user, "unstable", count)
 		if err != nil {
 			t.Fatalf("failed to add tailscale nodes: %s", err)
 		}

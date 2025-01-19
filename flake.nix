@@ -20,62 +20,79 @@
     {
       overlay = _: prev: let
         pkgs = nixpkgs.legacyPackages.${prev.system};
-      in rec {
-        headscale = pkgs.buildGo121Module rec {
+        buildGo = pkgs.buildGo123Module;
+      in {
+        headscale = buildGo rec {
           pname = "headscale";
           version = headscaleVersion;
           src = pkgs.lib.cleanSource self;
-
-          tags = ["ts2019"];
 
           # Only run unit tests when testing a build
           checkFlags = ["-short"];
 
           # When updating go.mod or go.sum, a new sha will need to be calculated,
-          # update this if you have a mismatch after doing a change to thos files.
-          vendorSha256 = "sha256-Q6eySc8lXYhkWka7Y+qOM6viv7QhdjFZDX8PttaLfr4=";
+          # update this if you have a mismatch after doing a change to those files.
+          vendorHash = "sha256-SBfeixT8DQOrK2SWmHHSOBtzRdSZs+pwomHpw6Jd+qc=";
+
+          subPackages = ["cmd/headscale"];
 
           ldflags = ["-s" "-w" "-X github.com/juanfont/headscale/cmd/headscale/cli.Version=v${version}"];
         };
 
-        golines = pkgs.buildGoModule rec {
-          pname = "golines";
-          version = "0.11.0";
-
-          src = pkgs.fetchFromGitHub {
-            owner = "segmentio";
-            repo = "golines";
-            rev = "v${version}";
-            sha256 = "sha256-2K9KAg8iSubiTbujyFGN3yggrL+EDyeUCs9OOta/19A=";
-          };
-
-          vendorSha256 = "sha256-rxYuzn4ezAxaeDhxd8qdOzt+CKYIh03A9zKNdzILq18=";
-
-          nativeBuildInputs = [pkgs.installShellFiles];
-        };
-
-        golangci-lint = prev.golangci-lint.override {
-          # Override https://github.com/NixOS/nixpkgs/pull/166801 which changed this
-          # to buildGo118Module because it does not build on Darwin.
-          inherit (prev) buildGoModule;
-        };
-
-        protoc-gen-grpc-gateway = pkgs.buildGoModule rec {
+        protoc-gen-grpc-gateway = buildGo rec {
           pname = "grpc-gateway";
-          version = "2.14.0";
+          version = "2.24.0";
 
           src = pkgs.fetchFromGitHub {
             owner = "grpc-ecosystem";
             repo = "grpc-gateway";
             rev = "v${version}";
-            sha256 = "sha256-lnNdsDCpeSHtl2lC1IhUw11t3cnGF+37qSM7HDvKLls=";
+            sha256 = "sha256-lUEoqXJF1k4/il9bdDTinkUV5L869njZNYqObG/mHyA=";
           };
 
-          vendorSha256 = "sha256-dGdnDuRbwg8fU7uB5GaHEWa/zI3w06onqjturvooJQA=";
+          vendorHash = "sha256-Ttt7bPKU+TMKRg5550BS6fsPwYp0QJqcZ7NLrhttSdw=";
 
           nativeBuildInputs = [pkgs.installShellFiles];
 
           subPackages = ["protoc-gen-grpc-gateway" "protoc-gen-openapiv2"];
+        };
+
+        protobuf-language-server = buildGo rec {
+          pname = "protobuf-language-server";
+          version = "2546944";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "lasorda";
+            repo = "protobuf-language-server";
+            rev = "${version}";
+            sha256 = "sha256-Cbr3ktT86RnwUntOiDKRpNTClhdyrKLTQG2ZEd6fKDc=";
+          };
+
+          vendorHash = "sha256-PfT90dhfzJZabzLTb1D69JCO+kOh2khrlpF5mCDeypk=";
+
+          subPackages = ["."];
+        };
+
+        # Upstream does not override buildGoModule properly,
+        # importing a specific module, so comment out for now.
+        # golangci-lint = prev.golangci-lint.override {
+        #   buildGoModule = buildGo;
+        # };
+
+        goreleaser = prev.goreleaser.override {
+          buildGoModule = buildGo;
+        };
+
+        gotestsum = prev.gotestsum.override {
+          buildGoModule = buildGo;
+        };
+
+        gotests = prev.gotests.override {
+          buildGoModule = buildGo;
+        };
+
+        gofumpt = prev.gofumpt.override {
+          buildGoModule = buildGo;
         };
       };
     }
@@ -85,7 +102,7 @@
         overlays = [self.overlay];
         inherit system;
       };
-      buildDeps = with pkgs; [git go_1_21 gnumake];
+      buildDeps = with pkgs; [git go_1_23 gnumake];
       devDeps = with pkgs;
         buildDeps
         ++ [
@@ -96,7 +113,12 @@
           nfpm
           gotestsum
           gotests
+          gofumpt
           ksh
+          ko
+          yq-go
+          ripgrep
+          postgresql
 
           # 'dot' is needed for pprof graphs
           # go tool pprof -http=: <source>
@@ -109,6 +131,7 @@
           protoc-gen-grpc-gateway
           buf
           clang-tools # clang-format
+          protobuf-language-server
         ];
 
       # Add entry to build a docker image with headscale
@@ -126,18 +149,32 @@
     in rec {
       # `nix develop`
       devShell = pkgs.mkShell {
-        buildInputs = devDeps;
+        buildInputs =
+          devDeps
+          ++ [
+            (pkgs.writeShellScriptBin
+              "nix-vendor-sri"
+              ''
+                set -eu
+
+                OUT=$(mktemp -d -t nar-hash-XXXXXX)
+                rm -rf "$OUT"
+
+                go mod vendor -o "$OUT"
+                go run tailscale.com/cmd/nardump --sri "$OUT"
+                rm -rf "$OUT"
+              '')
+
+            (pkgs.writeShellScriptBin
+              "go-mod-update-all"
+              ''
+                cat go.mod | ${pkgs.silver-searcher}/bin/ag "\t" | ${pkgs.silver-searcher}/bin/ag -v indirect | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.findutils}/bin/xargs go get -u
+                go mod tidy
+              '')
+          ];
 
         shellHook = ''
-          export GOFLAGS=-tags="ts2019"
           export PATH="$PWD/result/bin:$PATH"
-
-          mkdir -p ./ignored
-          export HEADSCALE_PRIVATE_KEY_PATH="./ignored/private.key"
-          export HEADSCALE_NOISE_PRIVATE_KEY_PATH="./ignored/noise_private.key"
-          export HEADSCALE_DB_PATH="./ignored/db.sqlite"
-          export HEADSCALE_TLS_LETSENCRYPT_CACHE_DIR="./ignored/cache"
-          export HEADSCALE_UNIX_SOCKET="./ignored/headscale.sock"
         '';
       };
 
@@ -171,7 +208,7 @@
             ${pkgs.golangci-lint}/bin/golangci-lint run --fix --timeout 10m
             ${pkgs.nodePackages.prettier}/bin/prettier --write '**/**.{ts,js,md,yaml,yml,sass,css,scss,html}'
             ${pkgs.golines}/bin/golines --max-len=88 --base-formatter=gofumpt -w ${./.}
-            ${pkgs.clang-tools}/bin/clang-format -style="{BasedOnStyle: Google, IndentWidth: 4, AlignConsecutiveDeclarations: true, AlignConsecutiveAssignments: true, ColumnLimit: 0}" -i ${./.}
+            ${pkgs.clang-tools}/bin/clang-format -i ${./.}
           '';
       };
     });

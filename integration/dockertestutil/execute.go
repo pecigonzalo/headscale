@@ -25,7 +25,6 @@ type ExecuteCommandOption func(*ExecuteCommandConfig) error
 func ExecuteCommandTimeout(timeout time.Duration) ExecuteCommandOption {
 	return ExecuteCommandOption(func(conf *ExecuteCommandConfig) error {
 		conf.timeout = timeout
-
 		return nil
 	})
 }
@@ -62,11 +61,12 @@ func ExecuteCommand(
 		exitCode, err := resource.Exec(
 			cmd,
 			dockertest.ExecOptions{
-				Env:    append(env, "HEADSCALE_LOG_LEVEL=disabled"),
+				Env:    append(env, "HEADSCALE_LOG_LEVEL=info"),
 				StdOut: &stdout,
 				StdErr: &stderr,
 			},
 		)
+
 		resultChan <- result{exitCode, err}
 	}()
 
@@ -74,7 +74,7 @@ func ExecuteCommand(
 	select {
 	case res := <-resultChan:
 		if res.err != nil {
-			return stdout.String(), stderr.String(), res.err
+			return stdout.String(), stderr.String(), fmt.Errorf("command failed, stderr: %s: %w", stderr.String(), res.err)
 		}
 
 		if res.exitCode != 0 {
@@ -83,12 +83,11 @@ func ExecuteCommand(
 			// log.Println("stdout: ", stdout.String())
 			// log.Println("stderr: ", stderr.String())
 
-			return stdout.String(), stderr.String(), ErrDockertestCommandFailed
+			return stdout.String(), stderr.String(), fmt.Errorf("command failed, stderr: %s: %w", stderr.String(), ErrDockertestCommandFailed)
 		}
 
 		return stdout.String(), stderr.String(), nil
 	case <-time.After(execConfig.timeout):
-
-		return stdout.String(), stderr.String(), ErrDockertestCommandTimeout
+		return stdout.String(), stderr.String(), fmt.Errorf("command failed, stderr: %s: %w", stderr.String(), ErrDockertestCommandTimeout)
 	}
 }

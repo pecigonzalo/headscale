@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,33 +39,33 @@ func init() {
 
 	err := registerNodeCmd.MarkFlagRequired("user")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	registerNodeCmd.Flags().StringP("key", "k", "", "Key")
 	err = registerNodeCmd.MarkFlagRequired("key")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(registerNodeCmd)
 
 	expireNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	err = expireNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(expireNodeCmd)
 
 	renameNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	err = renameNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(renameNodeCmd)
 
 	deleteNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	err = deleteNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(deleteNodeCmd)
 
@@ -72,7 +73,7 @@ func init() {
 
 	err = moveNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 
 	moveNodeCmd.Flags().StringP("user", "u", "", "New user")
@@ -84,7 +85,7 @@ func init() {
 
 	err = moveNodeCmd.MarkFlagRequired("user")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(moveNodeCmd)
 
@@ -92,11 +93,13 @@ func init() {
 
 	err = tagCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	tagCmd.Flags().
 		StringSliceP("tags", "t", []string{}, "List of tags to add to the node")
 	nodeCmd.AddCommand(tagCmd)
+
+	nodeCmd.AddCommand(backfillNodeIPsCmd)
 }
 
 var nodeCmd = &cobra.Command{
@@ -113,11 +116,9 @@ var registerNodeCmd = &cobra.Command{
 		user, err := cmd.Flags().GetString("user")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -128,8 +129,6 @@ var registerNodeCmd = &cobra.Command{
 				fmt.Sprintf("Error getting node key from flag: %s", err),
 				output,
 			)
-
-			return
 		}
 
 		request := &v1.RegisterNodeRequest{
@@ -147,13 +146,11 @@ var registerNodeCmd = &cobra.Command{
 				),
 				output,
 			)
-
-			return
 		}
 
 		SuccessOutput(
-			response.Node,
-			fmt.Sprintf("Node %s registered", response.Node.GivenName), output)
+			response.GetNode(),
+			fmt.Sprintf("Node %s registered", response.GetNode().GetGivenName()), output)
 	},
 }
 
@@ -166,17 +163,13 @@ var listNodesCmd = &cobra.Command{
 		user, err := cmd.Flags().GetString("user")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
-
-			return
 		}
 		showTags, err := cmd.Flags().GetBool("tags")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting tags flag: %s", err), output)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -191,21 +184,15 @@ var listNodesCmd = &cobra.Command{
 				fmt.Sprintf("Cannot get nodes: %s", status.Convert(err).Message()),
 				output,
 			)
-
-			return
 		}
 
 		if output != "" {
-			SuccessOutput(response.Nodes, "", output)
-
-			return
+			SuccessOutput(response.GetNodes(), "", output)
 		}
 
-		tableData, err := nodesToPtables(user, showTags, response.Nodes)
+		tableData, err := nodesToPtables(user, showTags, response.GetNodes())
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error converting to table: %s", err), output)
-
-			return
 		}
 
 		err = pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
@@ -215,8 +202,6 @@ var listNodesCmd = &cobra.Command{
 				fmt.Sprintf("Failed to render pterm table: %s", err),
 				output,
 			)
-
-			return
 		}
 	},
 }
@@ -240,7 +225,7 @@ var expireNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -262,7 +247,7 @@ var expireNodeCmd = &cobra.Command{
 			return
 		}
 
-		SuccessOutput(response.Node, "Node expired", output)
+		SuccessOutput(response.GetNode(), "Node expired", output)
 	},
 }
 
@@ -283,7 +268,7 @@ var renameNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -310,7 +295,7 @@ var renameNodeCmd = &cobra.Command{
 			return
 		}
 
-		SuccessOutput(response.Node, "Node renamed", output)
+		SuccessOutput(response.GetNode(), "Node renamed", output)
 	},
 }
 
@@ -332,7 +317,7 @@ var deleteNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -364,7 +349,7 @@ var deleteNodeCmd = &cobra.Command{
 			prompt := &survey.Confirm{
 				Message: fmt.Sprintf(
 					"Do you want to remove the node %s?",
-					getResponse.GetNode().Name,
+					getResponse.GetNode().GetName(),
 				),
 			}
 			err = survey.AskOne(prompt, &confirm)
@@ -432,7 +417,7 @@ var moveNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -473,7 +458,58 @@ var moveNodeCmd = &cobra.Command{
 			return
 		}
 
-		SuccessOutput(moveResponse.Node, "Node moved to another user", output)
+		SuccessOutput(moveResponse.GetNode(), "Node moved to another user", output)
+	},
+}
+
+var backfillNodeIPsCmd = &cobra.Command{
+	Use:   "backfillips",
+	Short: "Backfill IPs missing from nodes",
+	Long: `
+Backfill IPs can be used to add/remove IPs from nodes
+based on the current configuration of Headscale.
+
+If there are nodes that does not have IPv4 or IPv6
+even if prefixes for both are configured in the config,
+this command can be used to assign IPs of the sort to
+all nodes that are missing.
+
+If you remove IPv4 or IPv6 prefixes from the config,
+it can be run to remove the IPs that should no longer
+be assigned to nodes.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		var err error
+		output, _ := cmd.Flags().GetString("output")
+
+		confirm := false
+		prompt := &survey.Confirm{
+			Message: "Are you sure that you want to assign/remove IPs to/from nodes?",
+		}
+		err = survey.AskOne(prompt, &confirm)
+		if err != nil {
+			return
+		}
+		if confirm {
+			ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
+			defer cancel()
+			defer conn.Close()
+
+			changes, err := client.BackfillNodeIPs(ctx, &v1.BackfillNodeIPsRequest{Confirmed: confirm})
+			if err != nil {
+				ErrorOutput(
+					err,
+					fmt.Sprintf(
+						"Error backfilling IPs: %s",
+						status.Convert(err).Message(),
+					),
+					output,
+				)
+
+				return
+			}
+
+			SuccessOutput(changes, "Node IPs backfilled successfully", output)
+		}
 	},
 }
 
@@ -493,7 +529,7 @@ func nodesToPtables(
 		"Ephemeral",
 		"Last seen",
 		"Expiration",
-		"Online",
+		"Connected",
 		"Expired",
 	}
 	if showTags {
@@ -507,21 +543,21 @@ func nodesToPtables(
 
 	for _, node := range nodes {
 		var ephemeral bool
-		if node.PreAuthKey != nil && node.PreAuthKey.Ephemeral {
+		if node.GetPreAuthKey() != nil && node.GetPreAuthKey().GetEphemeral() {
 			ephemeral = true
 		}
 
 		var lastSeen time.Time
 		var lastSeenTime string
-		if node.LastSeen != nil {
-			lastSeen = node.LastSeen.AsTime()
+		if node.GetLastSeen() != nil {
+			lastSeen = node.GetLastSeen().AsTime()
 			lastSeenTime = lastSeen.Format("2006-01-02 15:04:05")
 		}
 
 		var expiry time.Time
 		var expiryTime string
-		if node.Expiry != nil {
-			expiry = node.Expiry.AsTime()
+		if node.GetExpiry() != nil {
+			expiry = node.GetExpiry().AsTime()
 			expiryTime = expiry.Format("2006-01-02 15:04:05")
 		} else {
 			expiryTime = "N/A"
@@ -529,7 +565,7 @@ func nodesToPtables(
 
 		var machineKey key.MachinePublic
 		err := machineKey.UnmarshalText(
-			[]byte(util.MachinePublicKeyEnsurePrefix(node.MachineKey)),
+			[]byte(node.GetMachineKey()),
 		)
 		if err != nil {
 			machineKey = key.MachinePublic{}
@@ -537,14 +573,14 @@ func nodesToPtables(
 
 		var nodeKey key.NodePublic
 		err = nodeKey.UnmarshalText(
-			[]byte(util.NodePublicKeyEnsurePrefix(node.NodeKey)),
+			[]byte(node.GetNodeKey()),
 		)
 		if err != nil {
 			return nil, err
 		}
 
 		var online string
-		if node.Online {
+		if node.GetOnline() {
 			online = pterm.LightGreen("online")
 		} else {
 			online = pterm.LightRed("offline")
@@ -558,36 +594,36 @@ func nodesToPtables(
 		}
 
 		var forcedTags string
-		for _, tag := range node.ForcedTags {
+		for _, tag := range node.GetForcedTags() {
 			forcedTags += "," + tag
 		}
 		forcedTags = strings.TrimLeft(forcedTags, ",")
 		var invalidTags string
-		for _, tag := range node.InvalidTags {
-			if !contains(node.ForcedTags, tag) {
+		for _, tag := range node.GetInvalidTags() {
+			if !slices.Contains(node.GetForcedTags(), tag) {
 				invalidTags += "," + pterm.LightRed(tag)
 			}
 		}
 		invalidTags = strings.TrimLeft(invalidTags, ",")
 		var validTags string
-		for _, tag := range node.ValidTags {
-			if !contains(node.ForcedTags, tag) {
+		for _, tag := range node.GetValidTags() {
+			if !slices.Contains(node.GetForcedTags(), tag) {
 				validTags += "," + pterm.LightGreen(tag)
 			}
 		}
 		validTags = strings.TrimLeft(validTags, ",")
 
 		var user string
-		if currentUser == "" || (currentUser == node.User.Name) {
-			user = pterm.LightMagenta(node.User.Name)
+		if currentUser == "" || (currentUser == node.GetUser().GetName()) {
+			user = pterm.LightMagenta(node.GetUser().GetName())
 		} else {
 			// Shared into this user
-			user = pterm.LightYellow(node.User.Name)
+			user = pterm.LightYellow(node.GetUser().GetName())
 		}
 
 		var IPV4Address string
 		var IPV6Address string
-		for _, addr := range node.IpAddresses {
+		for _, addr := range node.GetIpAddresses() {
 			if netip.MustParseAddr(addr).Is4() {
 				IPV4Address = addr
 			} else {
@@ -596,8 +632,8 @@ func nodesToPtables(
 		}
 
 		nodeData := []string{
-			strconv.FormatUint(node.Id, util.Base10),
-			node.Name,
+			strconv.FormatUint(node.GetId(), util.Base10),
+			node.GetName(),
 			node.GetGivenName(),
 			machineKey.ShortString(),
 			nodeKey.ShortString(),
@@ -627,7 +663,7 @@ var tagCmd = &cobra.Command{
 	Aliases: []string{"tags", "t"},
 	Run: func(cmd *cobra.Command, args []string) {
 		output, _ := cmd.Flags().GetString("output")
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 

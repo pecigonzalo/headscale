@@ -9,89 +9,19 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/gorilla/mux"
+	"github.com/juanfont/headscale/hscontrol/templates"
 	"github.com/rs/zerolog/log"
 )
-
-//go:embed templates/apple.html
-var appleTemplate string
-
-//go:embed templates/windows.html
-var windowsTemplate string
 
 // WindowsConfigMessage shows a simple message in the browser for how to configure the Windows Tailscale client.
 func (h *Headscale) WindowsConfigMessage(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
-	winTemplate := template.Must(template.New("windows").Parse(windowsTemplate))
-	config := map[string]interface{}{
-		"URL": h.cfg.ServerURL,
-	}
-
-	var payload bytes.Buffer
-	if err := winTemplate.Execute(&payload, config); err != nil {
-		log.Error().
-			Str("handler", "WindowsRegConfig").
-			Err(err).
-			Msg("Could not render Windows index template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Windows index template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
-
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	_, err := writer.Write(payload.Bytes())
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("Failed to write response")
-	}
-}
 
-// WindowsRegConfig generates and serves a .reg file configured with the Headscale server address.
-func (h *Headscale) WindowsRegConfig(
-	writer http.ResponseWriter,
-	req *http.Request,
-) {
-	config := WindowsRegistryConfig{
-		URL: h.cfg.ServerURL,
-	}
-
-	var content bytes.Buffer
-	if err := windowsRegTemplate.Execute(&content, config); err != nil {
-		log.Error().
-			Str("handler", "WindowsRegConfig").
-			Err(err).
-			Msg("Could not render Apple macOS template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Windows registry template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
-
-	writer.Header().Set("Content-Type", "text/x-ms-regedit; charset=utf-8")
-	writer.WriteHeader(http.StatusOK)
-	_, err := writer.Write(content.Bytes())
-	if err != nil {
+	if _, err := writer.Write([]byte(templates.Windows(h.cfg.ServerURL).Render())); err != nil {
 		log.Error().
 			Caller().
 			Err(err).
@@ -104,36 +34,10 @@ func (h *Headscale) AppleConfigMessage(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
-	appleTemplate := template.Must(template.New("apple").Parse(appleTemplate))
-
-	config := map[string]interface{}{
-		"URL": h.cfg.ServerURL,
-	}
-
-	var payload bytes.Buffer
-	if err := appleTemplate.Execute(&payload, config); err != nil {
-		log.Error().
-			Str("handler", "AppleMobileConfig").
-			Err(err).
-			Msg("Could not render Apple index template")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err := writer.Write([]byte("Could not render Apple index template"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
-
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	_, err := writer.Write(payload.Bytes())
-	if err != nil {
+
+	if _, err := writer.Write([]byte(templates.Apple(h.cfg.ServerURL).Render())); err != nil {
 		log.Error().
 			Caller().
 			Err(err).
@@ -305,10 +209,6 @@ func (h *Headscale) ApplePlatformConfig(
 	}
 }
 
-type WindowsRegistryConfig struct {
-	URL string
-}
-
 type AppleMobileConfig struct {
 	UUID    uuid.UUID
 	URL     string
@@ -319,14 +219,6 @@ type AppleMobilePlatformConfig struct {
 	UUID uuid.UUID
 	URL  string
 }
-
-var windowsRegTemplate = textTemplate.Must(
-	textTemplate.New("windowsconfig").Parse(`Windows Registry Editor Version 5.00
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Tailscale IPN]
-"UnattendedMode"="always"
-"LoginURL"="{{.URL}}"
-`))
 
 var commonTemplate = textTemplate.Must(
 	textTemplate.New("mobileconfig").Parse(`<?xml version="1.0" encoding="UTF-8"?>

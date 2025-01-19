@@ -1,5 +1,6 @@
 ignored/
 tailscale/
+.vscode/
 
 # Binaries for programs and plugins
 *.exe
@@ -21,6 +22,7 @@ dist/
 /headscale
 config.json
 config.yaml
+config*.yaml
 derp.yaml
 *.hujson
 *.key

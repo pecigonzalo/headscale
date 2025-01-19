@@ -1,17 +1,20 @@
 package hscontrol
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/chasefleming/elem-go"
+	"github.com/chasefleming/elem-go/attrs"
+	"github.com/chasefleming/elem-go/styles"
 	"github.com/gorilla/mux"
-	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/juanfont/headscale/hscontrol/templates"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -54,6 +57,65 @@ func parseCabailityVersion(req *http.Request) (tailcfg.CapabilityVersion, error)
 	return tailcfg.CapabilityVersion(clientCapabilityVersion), nil
 }
 
+func (h *Headscale) handleVerifyRequest(
+	req *http.Request,
+) (bool, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return false, fmt.Errorf("cannot read request body: %w", err)
+	}
+
+	var derpAdmitClientRequest tailcfg.DERPAdmitClientRequest
+	if err := json.Unmarshal(body, &derpAdmitClientRequest); err != nil {
+		return false, fmt.Errorf("cannot parse derpAdmitClientRequest: %w", err)
+	}
+
+	nodes, err := h.db.ListNodes()
+	if err != nil {
+		return false, fmt.Errorf("cannot list nodes: %w", err)
+	}
+
+	return nodes.ContainsNodeKey(derpAdmitClientRequest.NodePublic), nil
+}
+
+// see https://github.com/tailscale/tailscale/blob/964282d34f06ecc06ce644769c66b0b31d118340/derp/derp_server.go#L1159, Derp use verifyClientsURL to verify whether a client is allowed to connect to the DERP server.
+func (h *Headscale) VerifyHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	if req.Method != http.MethodPost {
+		http.Error(writer, "Wrong method", http.StatusMethodNotAllowed)
+
+		return
+	}
+	log.Debug().
+		Str("handler", "/verify").
+		Msg("verify client")
+
+	allow, err := h.handleVerifyRequest(req)
+	if err != nil {
+		log.Error().
+			Caller().
+			Err(err).
+			Msg("Failed to verify client")
+		http.Error(writer, "Internal error", http.StatusInternalServerError)
+	}
+
+	resp := tailcfg.DERPAdmitClientResponse{
+		Allow: allow,
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	err = json.NewEncoder(writer).Encode(resp)
+	if err != nil {
+		log.Error().
+			Caller().
+			Err(err).
+			Msg("Failed to write response")
+	}
+}
+
 // KeyHandler provides the Headscale pub key
 // Listens in /key.
 func (h *Headscale) KeyHandler(
@@ -63,65 +125,25 @@ func (h *Headscale) KeyHandler(
 	// New Tailscale clients send a 'v' parameter to indicate the CurrentCapabilityVersion
 	capVer, err := parseCabailityVersion(req)
 	if err != nil {
-		if errors.Is(err, ErrNoCapabilityVersion) {
-			log.Debug().
-				Str("handler", "/key").
-				Msg("New legacy client")
-			// Old clients don't send a 'v' parameter, so we send the legacy public key
-			writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			writer.WriteHeader(http.StatusOK)
-			_, err := writer.Write(
-				[]byte(util.MachinePublicKeyStripPrefix(h.privateKey2019.Public())),
-			)
-			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
-			}
-
-			return
-		}
-
 		log.Error().
 			Caller().
 			Err(err).
 			Msg("could not get capability version")
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusInternalServerError)
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
 
 		return
 	}
 
 	log.Debug().
 		Str("handler", "/key").
-		Int("v", int(capVer)).
+		Int("cap_ver", int(capVer)).
 		Msg("New noise client")
-	if err != nil {
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusBadRequest)
-		_, err := writer.Write([]byte("Wrong params"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
 
 	// TS2021 (Tailscale v2 protocol) requires to have a different key
 	if capVer >= NoiseCapabilityVersion {
 		resp := tailcfg.OverTLSPublicKeyResponse{
-			LegacyPublicKey: h.privateKey2019.Public(),
-			PublicKey:       h.noisePrivateKey.Public(),
+			PublicKey: h.noisePrivateKey.Public(),
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		writer.WriteHeader(http.StatusOK)
@@ -175,65 +197,76 @@ func (h *Headscale) HealthHandler(
 	respond(nil)
 }
 
-type registerWebAPITemplateConfig struct {
-	Key string
+var codeStyleRegisterWebAPI = styles.Props{
+	styles.Display:         "block",
+	styles.Padding:         "20px",
+	styles.Border:          "1px solid #bbb",
+	styles.BackgroundColor: "#eee",
 }
 
-var registerWebAPITemplate = template.Must(
-	template.New("registerweb").Parse(`
-<html>
-	<head>
-		<title>Registration - Headscale</title>
-	</head>
-	<body>
-		<h1>headscale</h1>
-		<h2>Machine registration</h2>
-		<p>
-			Run the command below in the headscale server to add this machine to your network:
-		</p>
-		<pre><code>headscale nodes register --user USERNAME --key {{.Key}}</code></pre>
-	</body>
-</html>
-`))
+func registerWebHTML(key string) *elem.Element {
+	return elem.Html(nil,
+		elem.Head(
+			nil,
+			elem.Title(nil, elem.Text("Registration - Headscale")),
+			elem.Meta(attrs.Props{
+				attrs.Name:    "viewport",
+				attrs.Content: "width=device-width, initial-scale=1",
+			}),
+		),
+		elem.Body(attrs.Props{
+			attrs.Style: styles.Props{
+				styles.FontFamily: "sans",
+			}.ToInline(),
+		},
+			elem.H1(nil, elem.Text("headscale")),
+			elem.H2(nil, elem.Text("Machine registration")),
+			elem.P(nil, elem.Text("Run the command below in the headscale server to add this machine to your network:")),
+			elem.Code(attrs.Props{attrs.Style: codeStyleRegisterWebAPI.ToInline()},
+				elem.Text(fmt.Sprintf("headscale nodes register --user USERNAME --key %s", key)),
+			),
+		),
+	)
+}
+
+type AuthProviderWeb struct {
+	serverURL string
+}
+
+func NewAuthProviderWeb(serverURL string) *AuthProviderWeb {
+	return &AuthProviderWeb{
+		serverURL: serverURL,
+	}
+}
+
+func (a *AuthProviderWeb) AuthURL(mKey key.MachinePublic) string {
+	return fmt.Sprintf(
+		"%s/register/%s",
+		strings.TrimSuffix(a.serverURL, "/"),
+		mKey.String())
+}
 
 // RegisterWebAPI shows a simple message in the browser to point to the CLI
 // Listens in /register/:nkey.
 //
 // This is not part of the Tailscale control API, as we could send whatever URL
 // in the RegisterResponse.AuthURL field.
-func (h *Headscale) RegisterWebAPI(
+func (a *AuthProviderWeb) RegisterHandler(
 	writer http.ResponseWriter,
 	req *http.Request,
 ) {
 	vars := mux.Vars(req)
-	nodeKeyStr, ok := vars["nkey"]
-
-	if !util.NodePublicKeyRegex.Match([]byte(nodeKeyStr)) {
-		log.Warn().Str("node_key", nodeKeyStr).Msg("Invalid node key passed to registration url")
-
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusUnauthorized)
-		_, err := writer.Write([]byte("Unauthorized"))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Msg("Failed to write response")
-		}
-
-		return
-	}
+	machineKeyStr := vars["mkey"]
 
 	// We need to make sure we dont open for XSS style injections, if the parameter that
 	// is passed as a key is not parsable/validated as a NodePublic key, then fail to render
 	// the template and log an error.
-	var nodeKey key.NodePublic
-	err := nodeKey.UnmarshalText(
-		[]byte(util.NodePublicKeyEnsurePrefix(nodeKeyStr)),
+	var machineKey key.MachinePublic
+	err := machineKey.UnmarshalText(
+		[]byte(machineKeyStr),
 	)
-
-	if !ok || nodeKeyStr == "" || err != nil {
-		log.Warn().Err(err).Msg("Failed to parse incoming nodekey")
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to parse incoming machinekey")
 
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusBadRequest)
@@ -248,34 +281,14 @@ func (h *Headscale) RegisterWebAPI(
 		return
 	}
 
-	var content bytes.Buffer
-	if err := registerWebAPITemplate.Execute(&content, registerWebAPITemplateConfig{
-		Key: nodeKeyStr,
-	}); err != nil {
-		log.Error().
-			Str("func", "RegisterWebAPI").
-			Err(err).
-			Msg("Could not render register web API template")
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, err = writer.Write([]byte("Could not render register web API template"))
-		if err != nil {
+	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+	if _, err := writer.Write([]byte(registerWebHTML(machineKey.String()).Render())); err != nil {
+		if _, err := writer.Write([]byte(templates.RegisterWeb(machineKey.String()).Render())); err != nil {
 			log.Error().
 				Caller().
 				Err(err).
 				Msg("Failed to write response")
 		}
-
-		return
-	}
-
-	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-	writer.WriteHeader(http.StatusOK)
-	_, err = writer.Write(content.Bytes())
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Msg("Failed to write response")
 	}
 }
