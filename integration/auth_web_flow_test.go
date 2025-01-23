@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -26,7 +27,7 @@ func TestAuthWebFlowAuthenticationPingAll(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	baseScenario, err := NewScenario()
+	baseScenario, err := NewScenario(dockertestMaxWait())
 	if err != nil {
 		t.Fatalf("failed to create scenario: %s", err)
 	}
@@ -34,14 +35,20 @@ func TestAuthWebFlowAuthenticationPingAll(t *testing.T) {
 	scenario := AuthWebFlowScenario{
 		Scenario: baseScenario,
 	}
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
 		"user2": len(MustTestVersions),
 	}
 
-	err = scenario.CreateHeadscaleEnv(spec, hsic.WithTestName("webauthping"))
+	err = scenario.CreateHeadscaleEnv(
+		spec,
+		hsic.WithTestName("webauthping"),
+		hsic.WithEmbeddedDERPServerOnly(),
+		hsic.WithTLS(),
+		hsic.WithHostnameAsServerURL(),
+	)
 	assertNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
@@ -52,6 +59,8 @@ func TestAuthWebFlowAuthenticationPingAll(t *testing.T) {
 
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
+
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -65,13 +74,13 @@ func TestAuthWebFlowLogoutAndRelogin(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	baseScenario, err := NewScenario()
+	baseScenario, err := NewScenario(dockertestMaxWait())
 	assertNoErr(t, err)
 
 	scenario := AuthWebFlowScenario{
 		Scenario: baseScenario,
 	}
-	defer scenario.Shutdown()
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	spec := map[string]int{
 		"user1": len(MustTestVersions),
@@ -89,6 +98,8 @@ func TestAuthWebFlowLogoutAndRelogin(t *testing.T) {
 
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
+
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
@@ -271,7 +282,16 @@ func (s *AuthWebFlowScenario) runHeadscaleRegister(userStr string, loginURL *url
 	loginURL.Host = fmt.Sprintf("%s:8080", headscale.GetIP())
 	loginURL.Scheme = "http"
 
-	httpClient := &http.Client{}
+	if len(headscale.GetCert()) > 0 {
+		loginURL.Scheme = "https"
+	}
+
+	insecureTransport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // nolint
+	}
+	httpClient := &http.Client{
+		Transport: insecureTransport,
+	}
 	ctx := context.Background()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, loginURL.String(), nil)
 	resp, err := httpClient.Do(req)

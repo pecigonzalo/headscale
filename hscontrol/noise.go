@@ -10,9 +10,8 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"tailscale.com/control/controlbase"
-	"tailscale.com/control/controlhttp"
+	"tailscale.com/control/controlhttp/controlhttpserver"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -72,7 +71,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		challenge: key.NewChallenge(),
 	}
 
-	noiseConn, err := controlhttp.AcceptHTTP(
+	noiseConn, err := controlhttpserver.AcceptHTTP(
 		req.Context(),
 		writer,
 		req,
@@ -95,22 +94,17 @@ func (h *Headscale) NoiseUpgradeHandler(
 	// The HTTP2 server that exposes this router is created for
 	// a single hijacked connection from /ts2021, using netutil.NewOneConnListener
 	router := mux.NewRouter()
+	router.Use(prometheusMiddleware)
 
 	router.HandleFunc("/machine/register", noiseServer.NoiseRegistrationHandler).
 		Methods(http.MethodPost)
 	router.HandleFunc("/machine/map", noiseServer.NoisePollNetMapHandler)
 
-	server := http.Server{
-		ReadTimeout: types.HTTPReadTimeout,
-	}
-
 	noiseServer.httpBaseConfig = &http.Server{
 		Handler:           router,
-		ReadHeaderTimeout: types.HTTPReadTimeout,
+		ReadHeaderTimeout: types.HTTPTimeout,
 	}
 	noiseServer.http2Server = &http2.Server{}
-
-	server.Handler = h2c.NewHandler(router, noiseServer.http2Server)
 
 	noiseServer.http2Server.ServeConn(
 		noiseConn,
@@ -162,4 +156,79 @@ func (ns *noiseServer) earlyNoise(protocolVersion int, writer io.Writer) error {
 	}
 
 	return nil
+}
+
+const (
+	MinimumCapVersion tailcfg.CapabilityVersion = 82
+)
+
+// NoisePollNetMapHandler takes care of /machine/:id/map using the Noise protocol
+//
+// This is the busiest endpoint, as it keeps the HTTP long poll that updates
+// the clients when something in the network changes.
+//
+// The clients POST stuff like HostInfo and their Endpoints here, but
+// only after their first request (marked with the ReadOnly field).
+//
+// At this moment the updates are sent in a quite horrendous way, but they kinda work.
+func (ns *noiseServer) NoisePollNetMapHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	body, _ := io.ReadAll(req.Body)
+
+	mapRequest := tailcfg.MapRequest{}
+	if err := json.Unmarshal(body, &mapRequest); err != nil {
+		log.Error().
+			Caller().
+			Err(err).
+			Msg("Cannot parse MapRequest")
+		http.Error(writer, "Internal error", http.StatusInternalServerError)
+
+		return
+	}
+
+	log.Trace().
+		Caller().
+		Str("handler", "NoisePollNetMap").
+		Any("headers", req.Header).
+		Str("node", mapRequest.Hostinfo.Hostname).
+		Int("capver", int(mapRequest.Version)).
+		Msg("PollNetMapHandler called")
+
+	// Reject unsupported versions
+	if mapRequest.Version < MinimumCapVersion {
+		log.Info().
+			Caller().
+			Int("min_version", int(MinimumCapVersion)).
+			Int("client_version", int(mapRequest.Version)).
+			Msg("unsupported client connected")
+		http.Error(writer, "Internal error", http.StatusBadRequest)
+
+		return
+	}
+
+	ns.nodeKey = mapRequest.NodeKey
+
+	node, err := ns.headscale.db.GetNodeByAnyKey(
+		ns.conn.Peer(),
+		mapRequest.NodeKey,
+		key.NodePublic{},
+	)
+	if err != nil {
+		log.Error().
+			Str("handler", "NoisePollNetMap").
+			Msgf("Failed to fetch node from the database with node key: %s", mapRequest.NodeKey.String())
+		http.Error(writer, "Internal error", http.StatusInternalServerError)
+
+		return
+	}
+
+	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, node)
+	sess.tracef("a node sending a MapRequest with Noise protocol")
+	if !sess.isStreaming() {
+		sess.serve()
+	} else {
+		sess.serveLongPoll()
+	}
 }

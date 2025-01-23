@@ -7,100 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestNormalizeToFQDNRules(t *testing.T) {
-	type args struct {
-		name             string
-		stripEmailDomain bool
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    string
-		wantErr bool
-	}{
-		{
-			name: "normalize simple name",
-			args: args{
-				name:             "normalize-simple.name",
-				stripEmailDomain: false,
-			},
-			want:    "normalize-simple.name",
-			wantErr: false,
-		},
-		{
-			name: "normalize an email",
-			args: args{
-				name:             "foo.bar@example.com",
-				stripEmailDomain: false,
-			},
-			want:    "foo.bar.example.com",
-			wantErr: false,
-		},
-		{
-			name: "normalize an email domain should be removed",
-			args: args{
-				name:             "foo.bar@example.com",
-				stripEmailDomain: true,
-			},
-			want:    "foo.bar",
-			wantErr: false,
-		},
-		{
-			name: "strip enabled no email passed as argument",
-			args: args{
-				name:             "not-email-and-strip-enabled",
-				stripEmailDomain: true,
-			},
-			want:    "not-email-and-strip-enabled",
-			wantErr: false,
-		},
-		{
-			name: "normalize complex email",
-			args: args{
-				name:             "foo.bar+complex-email@example.com",
-				stripEmailDomain: false,
-			},
-			want:    "foo.bar-complex-email.example.com",
-			wantErr: false,
-		},
-		{
-			name: "user name with space",
-			args: args{
-				name:             "name space",
-				stripEmailDomain: false,
-			},
-			want:    "name-space",
-			wantErr: false,
-		},
-		{
-			name: "user with quote",
-			args: args{
-				name:             "Jamie's iPhone 5",
-				stripEmailDomain: false,
-			},
-			want:    "jamies-iphone-5",
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := NormalizeToFQDNRules(tt.args.name, tt.args.stripEmailDomain)
-			if (err != nil) != tt.wantErr {
-				t.Errorf(
-					"NormalizeToFQDNRules() error = %v, wantErr %v",
-					err,
-					tt.wantErr,
-				)
-
-				return
-			}
-			if got != tt.want {
-				t.Errorf("NormalizeToFQDNRules() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestCheckForFQDNRules(t *testing.T) {
 	type args struct {
 		name string
@@ -147,11 +53,54 @@ func TestCheckForFQDNRules(t *testing.T) {
 	}
 }
 
-func TestMagicDNSRootDomains100(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("100.64.0.0/10"),
+func TestConvertWithFQDNRules(t *testing.T) {
+	tests := []struct {
+		name        string
+		hostname    string
+		dnsHostName string
+	}{
+		{
+			name:        "User1.test",
+			hostname:    "User1.Test",
+			dnsHostName: "user1.test",
+		},
+		{
+			name:        "User'1$2.test",
+			hostname:    "User'1$2.Test",
+			dnsHostName: "user12.test",
+		},
+		{
+			name:        "User-^_12.local.test",
+			hostname:    "User-^_12.local.Test",
+			dnsHostName: "user-12.local.test",
+		},
+		{
+			name:        "User-MacBook-Pro",
+			hostname:    "User-MacBook-Pro",
+			dnsHostName: "user-macbook-pro",
+		},
+		{
+			name:        "User-Linux-Ubuntu/Fedora",
+			hostname:    "User-Linux-Ubuntu/Fedora",
+			dnsHostName: "user-linux-ubuntufedora",
+		},
+		{
+			name:        "User-[Space]123",
+			hostname:    "User-[ ]123",
+			dnsHostName: "user-123",
+		},
 	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fqdnHostName := ConvertWithFQDNRules(tt.hostname)
+			assert.Equal(t, tt.dnsHostName, fqdnHostName)
+		})
+	}
+}
+
+func TestMagicDNSRootDomains100(t *testing.T) {
+	domains := GenerateIPv4DNSRootDomain(netip.MustParsePrefix("100.64.0.0/10"))
 
 	found := false
 	for _, domain := range domains {
@@ -185,10 +134,7 @@ func TestMagicDNSRootDomains100(t *testing.T) {
 }
 
 func TestMagicDNSRootDomains172(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("172.16.0.0/16"),
-	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+	domains := GenerateIPv4DNSRootDomain(netip.MustParsePrefix("172.16.0.0/16"))
 
 	found := false
 	for _, domain := range domains {
@@ -213,20 +159,14 @@ func TestMagicDNSRootDomains172(t *testing.T) {
 
 // Happens when netmask is a multiple of 4 bits (sounds likely).
 func TestMagicDNSRootDomainsIPv6Single(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
-	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+	domains := GenerateIPv6DNSRootDomain(netip.MustParsePrefix("fd7a:115c:a1e0::/48"))
 
 	assert.Len(t, domains, 1)
 	assert.Equal(t, "0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa.", domains[0].WithTrailingDot())
 }
 
 func TestMagicDNSRootDomainsIPv6SingleMultiple(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("fd7a:115c:a1e0::/50"),
-	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+	domains := GenerateIPv6DNSRootDomain(netip.MustParsePrefix("fd7a:115c:a1e0::/50"))
 
 	yieldsRoot := func(dom string) bool {
 		for _, candidate := range domains {

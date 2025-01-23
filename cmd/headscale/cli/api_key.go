@@ -29,11 +29,16 @@ func init() {
 	apiKeysCmd.AddCommand(createAPIKeyCmd)
 
 	expireAPIKeyCmd.Flags().StringP("prefix", "p", "", "ApiKey prefix")
-	err := expireAPIKeyCmd.MarkFlagRequired("prefix")
-	if err != nil {
+	if err := expireAPIKeyCmd.MarkFlagRequired("prefix"); err != nil {
 		log.Fatal().Err(err).Msg("")
 	}
 	apiKeysCmd.AddCommand(expireAPIKeyCmd)
+
+	deleteAPIKeyCmd.Flags().StringP("prefix", "p", "", "ApiKey prefix")
+	if err := deleteAPIKeyCmd.MarkFlagRequired("prefix"); err != nil {
+		log.Fatal().Err(err).Msg("")
+	}
+	apiKeysCmd.AddCommand(deleteAPIKeyCmd)
 }
 
 var apiKeysCmd = &cobra.Command{
@@ -49,7 +54,7 @@ var listAPIKeys = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		output, _ := cmd.Flags().GetString("output")
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -62,24 +67,20 @@ var listAPIKeys = &cobra.Command{
 				fmt.Sprintf("Error getting the list of keys: %s", err),
 				output,
 			)
-
-			return
 		}
 
 		if output != "" {
-			SuccessOutput(response.ApiKeys, "", output)
-
-			return
+			SuccessOutput(response.GetApiKeys(), "", output)
 		}
 
 		tableData := pterm.TableData{
 			{"ID", "Prefix", "Expiration", "Created"},
 		}
-		for _, key := range response.ApiKeys {
+		for _, key := range response.GetApiKeys() {
 			expiration := "-"
 
 			if key.GetExpiration() != nil {
-				expiration = ColourTime(key.Expiration.AsTime())
+				expiration = ColourTime(key.GetExpiration().AsTime())
 			}
 
 			tableData = append(tableData, []string{
@@ -97,8 +98,6 @@ var listAPIKeys = &cobra.Command{
 				fmt.Sprintf("Failed to render pterm table: %s", err),
 				output,
 			)
-
-			return
 		}
 	},
 }
@@ -114,9 +113,6 @@ If you loose a key, create a new one and revoke (expire) the old one.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		output, _ := cmd.Flags().GetString("output")
 
-		log.Trace().
-			Msg("Preparing to create ApiKey")
-
 		request := &v1.CreateApiKeyRequest{}
 
 		durationStr, _ := cmd.Flags().GetString("expiration")
@@ -128,19 +124,13 @@ If you loose a key, create a new one and revoke (expire) the old one.`,
 				fmt.Sprintf("Could not parse duration: %s\n", err),
 				output,
 			)
-
-			return
 		}
 
 		expiration := time.Now().UTC().Add(time.Duration(duration))
 
-		log.Trace().
-			Dur("expiration", time.Duration(duration)).
-			Msg("expiration has been set")
-
 		request.Expiration = timestamppb.New(expiration)
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -151,11 +141,9 @@ If you loose a key, create a new one and revoke (expire) the old one.`,
 				fmt.Sprintf("Cannot create Api Key: %s\n", err),
 				output,
 			)
-
-			return
 		}
 
-		SuccessOutput(response.ApiKey, response.ApiKey, output)
+		SuccessOutput(response.GetApiKey(), response.GetApiKey(), output)
 	},
 }
 
@@ -173,11 +161,9 @@ var expireAPIKeyCmd = &cobra.Command{
 				fmt.Sprintf("Error getting prefix from CLI flag: %s", err),
 				output,
 			)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -192,10 +178,45 @@ var expireAPIKeyCmd = &cobra.Command{
 				fmt.Sprintf("Cannot expire Api Key: %s\n", err),
 				output,
 			)
-
-			return
 		}
 
 		SuccessOutput(response, "Key expired", output)
+	},
+}
+
+var deleteAPIKeyCmd = &cobra.Command{
+	Use:     "delete",
+	Short:   "Delete an ApiKey",
+	Aliases: []string{"remove", "del"},
+	Run: func(cmd *cobra.Command, args []string) {
+		output, _ := cmd.Flags().GetString("output")
+
+		prefix, err := cmd.Flags().GetString("prefix")
+		if err != nil {
+			ErrorOutput(
+				err,
+				fmt.Sprintf("Error getting prefix from CLI flag: %s", err),
+				output,
+			)
+		}
+
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
+		defer cancel()
+		defer conn.Close()
+
+		request := &v1.DeleteApiKeyRequest{
+			Prefix: prefix,
+		}
+
+		response, err := client.DeleteApiKey(ctx, request)
+		if err != nil {
+			ErrorOutput(
+				err,
+				fmt.Sprintf("Cannot delete Api Key: %s\n", err),
+				output,
+			)
+		}
+
+		SuccessOutput(response, "Key deleted", output)
 	},
 }

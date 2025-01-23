@@ -6,8 +6,8 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
+	"unicode"
 
-	"github.com/spf13/viper"
 	"go4.org/netipx"
 	"tailscale.com/util/dnsname"
 )
@@ -21,40 +21,47 @@ const (
 	LabelHostnameLength = 63
 )
 
+var invalidDNSRegex = regexp.MustCompile("[^a-z0-9-.]+")
 var invalidCharsInUserRegex = regexp.MustCompile("[^a-z0-9-.]+")
 
 var ErrInvalidUserName = errors.New("invalid user name")
 
-func NormalizeToFQDNRulesConfigFromViper(name string) (string, error) {
-	strip := viper.GetBool("oidc.strip_email_domain")
-
-	return NormalizeToFQDNRules(name, strip)
-}
-
-// NormalizeToFQDNRules will replace forbidden chars in user
-// it can also return an error if the user doesn't respect RFC 952 and 1123.
-func NormalizeToFQDNRules(name string, stripEmailDomain bool) (string, error) {
-	name = strings.ToLower(name)
-	name = strings.ReplaceAll(name, "'", "")
-	atIdx := strings.Index(name, "@")
-	if stripEmailDomain && atIdx > 0 {
-		name = name[:atIdx]
-	} else {
-		name = strings.ReplaceAll(name, "@", ".")
+// ValidateUsername checks if a username is valid.
+// It must be at least 2 characters long, start with a letter, and contain
+// only letters, numbers, hyphens, dots, and underscores.
+// It cannot contain more than one '@'.
+// It cannot contain invalid characters.
+func ValidateUsername(username string) error {
+	// Ensure the username meets the minimum length requirement
+	if len(username) < 2 {
+		return errors.New("username must be at least 2 characters long")
 	}
-	name = invalidCharsInUserRegex.ReplaceAllString(name, "-")
 
-	for _, elt := range strings.Split(name, ".") {
-		if len(elt) > LabelHostnameLength {
-			return "", fmt.Errorf(
-				"label %v is more than 63 chars: %w",
-				elt,
-				ErrInvalidUserName,
-			)
+	// Ensure the username does not start with a number
+	if unicode.IsDigit(rune(username[0])) {
+		return errors.New("username cannot start with a number")
+	}
+
+	atCount := 0
+	for _, char := range username {
+		switch {
+		case unicode.IsLetter(char),
+			unicode.IsDigit(char),
+			char == '-',
+			char == '.',
+			char == '_':
+			// Valid characters
+		case char == '@':
+			atCount++
+			if atCount > 1 {
+				return errors.New("username cannot contain more than one '@'")
+			}
+		default:
+			return fmt.Errorf("username contains invalid character: '%c'", char)
 		}
 	}
 
-	return name, nil
+	return nil
 }
 
 func CheckForFQDNRules(name string) error {
@@ -72,7 +79,7 @@ func CheckForFQDNRules(name string) error {
 			ErrInvalidUserName,
 		)
 	}
-	if invalidCharsInUserRegex.MatchString(name) {
+	if invalidDNSRegex.MatchString(name) {
 		return fmt.Errorf(
 			"DNS segment should only be composed of lowercase ASCII letters numbers, hyphen and dots. %v doesn't comply with theses rules: %w",
 			name,
@@ -81,6 +88,13 @@ func CheckForFQDNRules(name string) error {
 	}
 
 	return nil
+}
+
+func ConvertWithFQDNRules(name string) string {
+	name = strings.ToLower(name)
+	name = invalidDNSRegex.ReplaceAllString(name, "")
+
+	return name
 }
 
 // generateMagicDNSRootDomains generates a list of DNS entries to be included in `Routes` in `MapResponse`.
@@ -103,33 +117,7 @@ func CheckForFQDNRules(name string) error {
 
 // From the netmask we can find out the wildcard bits (the bits that are not set in the netmask).
 // This allows us to then calculate the subnets included in the subsequent class block and generate the entries.
-func GenerateMagicDNSRootDomains(ipPrefixes []netip.Prefix) []dnsname.FQDN {
-	fqdns := make([]dnsname.FQDN, 0, len(ipPrefixes))
-	for _, ipPrefix := range ipPrefixes {
-		var generateDNSRoot func(netip.Prefix) []dnsname.FQDN
-		switch ipPrefix.Addr().BitLen() {
-		case ipv4AddressLength:
-			generateDNSRoot = generateIPv4DNSRootDomain
-
-		case ipv6AddressLength:
-			generateDNSRoot = generateIPv6DNSRootDomain
-
-		default:
-			panic(
-				fmt.Sprintf(
-					"unsupported IP version with address length %d",
-					ipPrefix.Addr().BitLen(),
-				),
-			)
-		}
-
-		fqdns = append(fqdns, generateDNSRoot(ipPrefix)...)
-	}
-
-	return fqdns
-}
-
-func generateIPv4DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
+func GenerateIPv4DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 	// Conversion to the std lib net.IPnet, a bit easier to operate
 	netRange := netipx.PrefixIPNet(ipPrefix)
 	maskBits, _ := netRange.Mask.Size()
@@ -165,7 +153,27 @@ func generateIPv4DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 	return fqdns
 }
 
-func generateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
+// generateMagicDNSRootDomains generates a list of DNS entries to be included in `Routes` in `MapResponse`.
+// This list of reverse DNS entries instructs the OS on what subnets and domains the Tailscale embedded DNS
+// server (listening in 100.100.100.100 udp/53) should be used for.
+//
+// Tailscale.com includes in the list:
+// - the `BaseDomain` of the user
+// - the reverse DNS entry for IPv6 (0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa., see below more on IPv6)
+// - the reverse DNS entries for the IPv4 subnets covered by the user's `IPPrefix`.
+//   In the public SaaS this is [64-127].100.in-addr.arpa.
+//
+// The main purpose of this function is then generating the list of IPv4 entries. For the 100.64.0.0/10, this
+// is clear, and could be hardcoded. But we are allowing any range as `IPPrefix`, so we need to find out the
+// subnets when we have 172.16.0.0/16 (i.e., [0-255].16.172.in-addr.arpa.), or any other subnet.
+//
+// How IN-ADDR.ARPA domains work is defined in RFC1035 (section 3.5). Tailscale.com seems to adhere to this,
+// and do not make use of RFC2317 ("Classless IN-ADDR.ARPA delegation") - hence generating the entries for the next
+// class block only.
+
+// From the netmask we can find out the wildcard bits (the bits that are not set in the netmask).
+// This allows us to then calculate the subnets included in the subsequent class block and generate the entries.
+func GenerateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 	const nibbleLen = 4
 
 	maskBits, _ := netipx.PrefixIPNet(ipPrefix).Mask.Size()
@@ -213,4 +221,33 @@ func generateIPv6DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
 	}
 
 	return fqdns
+}
+
+// TODO(kradalby): Reintroduce when strip_email_domain is removed
+// after #2170 is cleaned up
+// DEPRECATED: DO NOT USE
+// NormalizeToFQDNRules will replace forbidden chars in user
+// it can also return an error if the user doesn't respect RFC 952 and 1123.
+func NormalizeToFQDNRules(name string, stripEmailDomain bool) (string, error) {
+	name = strings.ToLower(name)
+	name = strings.ReplaceAll(name, "'", "")
+	atIdx := strings.Index(name, "@")
+	if stripEmailDomain && atIdx > 0 {
+		name = name[:atIdx]
+	} else {
+		name = strings.ReplaceAll(name, "@", ".")
+	}
+	name = invalidDNSRegex.ReplaceAllString(name, "-")
+
+	for _, elt := range strings.Split(name, ".") {
+		if len(elt) > LabelHostnameLength {
+			return "", fmt.Errorf(
+				"label %v is more than 63 chars: %w",
+				elt,
+				ErrInvalidUserName,
+			)
+		}
+	}
+
+	return name, nil
 }

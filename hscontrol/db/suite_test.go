@@ -1,12 +1,17 @@
 package db
 
 import (
-	"net/netip"
+	"context"
+	"log"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 
-	"github.com/juanfont/headscale/hscontrol/notifier"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"gopkg.in/check.v1"
+	"zombiezen.com/go/postgrestest"
 )
 
 func Test(t *testing.T) {
@@ -27,30 +32,99 @@ func (s *Suite) SetUpTest(c *check.C) {
 }
 
 func (s *Suite) TearDownTest(c *check.C) {
-	os.RemoveAll(tmpDir)
+	// os.RemoveAll(tmpDir)
 }
 
 func (s *Suite) ResetDB(c *check.C) {
-	if len(tmpDir) != 0 {
-		os.RemoveAll(tmpDir)
-	}
+	// if len(tmpDir) != 0 {
+	// 	os.RemoveAll(tmpDir)
+	// }
+
 	var err error
-	tmpDir, err = os.MkdirTemp("", "autoygg-client-test")
+	db, err = newSQLiteTestDB()
 	if err != nil {
 		c.Fatal(err)
+	}
+}
+
+// TODO(kradalby): make this a t.Helper when we dont depend
+// on check test framework.
+func newSQLiteTestDB() (*HSDatabase, error) {
+	var err error
+	tmpDir, err = os.MkdirTemp("", "headscale-db-test-*")
+	if err != nil {
+		return nil, err
 	}
 
+	log.Printf("database path: %s", tmpDir+"/headscale_test.db")
+
 	db, err = NewHeadscaleDatabase(
-		"sqlite3",
-		tmpDir+"/headscale_test.db",
-		false,
-		notifier.NewNotifier(),
-		[]netip.Prefix{
-			netip.MustParsePrefix("10.27.0.0/23"),
+		types.DatabaseConfig{
+			Type: types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{
+				Path: tmpDir + "/headscale_test.db",
+			},
 		},
 		"",
+		emptyCache(),
 	)
 	if err != nil {
-		c.Fatal(err)
+		return nil, err
 	}
+
+	return db, nil
+}
+
+func newPostgresTestDB(t *testing.T) *HSDatabase {
+	t.Helper()
+
+	return newHeadscaleDBFromPostgresURL(t, newPostgresDBForTest(t))
+}
+
+func newPostgresDBForTest(t *testing.T) *url.URL {
+	t.Helper()
+
+	ctx := context.Background()
+	srv, err := postgrestest.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Cleanup)
+
+	u, err := srv.CreateDatabase(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("created local postgres: %s", u)
+	pu, _ := url.Parse(u)
+
+	return pu
+}
+
+func newHeadscaleDBFromPostgresURL(t *testing.T, pu *url.URL) *HSDatabase {
+	t.Helper()
+
+	pass, _ := pu.User.Password()
+	port, _ := strconv.Atoi(pu.Port())
+
+	db, err := NewHeadscaleDatabase(
+		types.DatabaseConfig{
+			Type: types.DatabasePostgres,
+			Postgres: types.PostgresConfig{
+				Host: pu.Hostname(),
+				User: pu.User.Username(),
+				Name: strings.TrimLeft(pu.Path, "/"),
+				Pass: pass,
+				Port: port,
+				Ssl:  "disable",
+			},
+		},
+		"",
+		emptyCache(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return db
 }
