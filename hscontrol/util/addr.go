@@ -2,20 +2,16 @@ package util
 
 import (
 	"fmt"
+	"iter"
 	"net/netip"
-	"reflect"
 	"strings"
 
 	"go4.org/netipx"
 )
 
-// This is borrowed from, and updated to use IPSet
+// This is borrowed from, and updated to use [netipx.IPSet]
 // https://github.com/tailscale/tailscale/blob/71029cea2ddf82007b80f465b256d027eab0f02d/wgengine/filter/tailcfg.go#L97-L162
 // TODO(kradalby): contribute upstream and make public.
-var (
-	zeroIP4 = netip.AddrFrom4([4]byte{})
-	zeroIP6 = netip.AddrFrom16([16]byte{})
-)
 
 // parseIPSet parses arg as one:
 //
@@ -24,14 +20,14 @@ var (
 //   - a CIDR (e.g. "192.168.0.0/16")
 //   - a range of two IPs, inclusive, separated by hyphen ("2eff::1-2eff::0800")
 //
-// bits, if non-nil, is the legacy SrcBits CIDR length to make a IP
+// bits, if non-nil, is the legacy [tailcfg.FilterRule.SrcBits] CIDR length to make a IP
 // address (without a slash) treated as a CIDR of *bits length.
 // nolint
 func ParseIPSet(arg string, bits *int) (*netipx.IPSet, error) {
 	var ipSet netipx.IPSetBuilder
 	if arg == "*" {
-		ipSet.AddPrefix(netip.PrefixFrom(zeroIP4, 0))
-		ipSet.AddPrefix(netip.PrefixFrom(zeroIP6, 0))
+		ipSet.AddPrefix(netip.PrefixFrom(netip.IPv4Unspecified(), 0))
+		ipSet.AddPrefix(netip.PrefixFrom(netip.IPv6Unspecified(), 0))
 
 		return ipSet.IPSet()
 	}
@@ -90,12 +86,9 @@ func ParseIPSet(arg string, bits *int) (*netipx.IPSet, error) {
 }
 
 func GetIPPrefixEndpoints(na netip.Prefix) (netip.Addr, netip.Addr) {
-	var network, broadcast netip.Addr
 	ipRange := netipx.RangeOfPrefix(na)
-	network = ipRange.From()
-	broadcast = ipRange.To()
 
-	return network, broadcast
+	return ipRange.From(), ipRange.To()
 }
 
 func StringToIPPrefix(prefixes []string) ([]netip.Prefix, error) {
@@ -104,7 +97,7 @@ func StringToIPPrefix(prefixes []string) ([]netip.Prefix, error) {
 	for index, prefixStr := range prefixes {
 		prefix, err := netip.ParsePrefix(prefixStr)
 		if err != nil {
-			return []netip.Prefix{}, err
+			return nil, err
 		}
 
 		result[index] = prefix
@@ -113,12 +106,15 @@ func StringToIPPrefix(prefixes []string) ([]netip.Prefix, error) {
 	return result, nil
 }
 
-func StringOrPrefixListContains[T string | netip.Prefix](ts []T, t T) bool {
-	for _, v := range ts {
-		if reflect.DeepEqual(v, t) {
-			return true
+// IPSetAddrIter returns a function that iterates over all the IPs in the [netipx.IPSet].
+func IPSetAddrIter(ipSet *netipx.IPSet) iter.Seq[netip.Addr] {
+	return func(yield func(netip.Addr) bool) {
+		for _, rng := range ipSet.Ranges() {
+			for ip := rng.From(); ip.Compare(rng.To()) <= 0; ip = ip.Next() {
+				if !yield(ip) {
+					return
+				}
+			}
 		}
 	}
-
-	return false
 }

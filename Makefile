@@ -1,55 +1,149 @@
-# Calculate version
-version ?= $(shell git describe --always --tags --dirty)
+# Headscale Makefile
+# Modern Makefile following best practices
 
-rwildcard=$(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2) $(filter $(subst *,%,$2),$d))
+# Version calculation
+VERSION ?= $(shell git describe --always --tags --dirty)
 
-# Determine if OS supports pie
+# Build configuration
 GOOS ?= $(shell uname | tr '[:upper:]' '[:lower:]')
-ifeq ($(filter $(GOOS), openbsd netbsd soloaris plan9), )
-	pieflags = -buildmode=pie
-else
+ifeq ($(filter $(GOOS), openbsd netbsd solaris plan9), )
+	PIE_FLAGS = -buildmode=pie
 endif
 
-TAGS = -tags ts2019
+# Tool availability check with nix warning
+define check_tool
+	@command -v $(1) >/dev/null 2>&1 || { \
+		echo "Warning: $(1) not found. Run 'nix develop' to ensure all dependencies are available."; \
+		exit 1; \
+	}
+endef
 
-# GO_SOURCES = $(wildcard *.go)
-# PROTO_SOURCES = $(wildcard **/*.proto)
-GO_SOURCES = $(call rwildcard,,*.go)
-PROTO_SOURCES = $(call rwildcard,,*.proto)
+# Source file collections using shell find for better performance
+GO_SOURCES := $(shell find . -name '*.go' -not -path './gen/*' -not -path './vendor/*')
+PRETTIER_SOURCES := $(shell find . \( -name '*.md' -o -name '*.yaml' -o -name '*.yml' -o -name '*.ts' -o -name '*.js' -o -name '*.html' -o -name '*.css' -o -name '*.scss' -o -name '*.sass' \) -not -path './gen/*' -not -path './vendor/*' -not -path './node_modules/*')
+
+# Default target
+.PHONY: all
+all: lint test build
+
+# Dependency checking
+.PHONY: check-deps
+check-deps:
+	$(call check_tool,go)
+	$(call check_tool,golangci-lint)
+	$(call check_tool,gofumpt)
+	$(call check_tool,mdformat)
+	$(call check_tool,prettier)
+
+# Build targets
+.PHONY: build
+build: check-deps $(GO_SOURCES) go.mod go.sum
+	@echo "Building headscale..."
+	go build $(PIE_FLAGS) -ldflags "-X main.version=$(VERSION)" -o headscale ./cmd/headscale
+
+# Test targets
+.PHONY: test
+test: check-deps $(GO_SOURCES) go.mod go.sum
+	@echo "Running Go tests..."
+	CGO_ENABLED=1 go test -race ./...
 
 
-build:
-	nix build
+# Formatting targets
+.PHONY: fmt
+fmt: fmt-go fmt-mdformat fmt-prettier
 
-dev: lint test build
+.PHONY: fmt-go
+fmt-go: check-deps $(GO_SOURCES)
+	@echo "Formatting Go code..."
+	gofumpt -l -w .
+	golangci-lint run --fix
 
-test:
-	gotestsum -- $(TAGS) -short -coverprofile=coverage.out ./...
+.PHONY: fmt-mdformat
+fmt-mdformat: check-deps
+	@echo "Formatting documentation..."
+	mdformat docs/
 
-test_integration:
-	docker run \
-		-t --rm \
-		-v ~/.cache/hs-integration-go:/go \
-		--name headscale-test-suite \
-		-v $$PWD:$$PWD -w $$PWD/integration \
-		-v /var/run/docker.sock:/var/run/docker.sock \
-		golang:1 \
-		go run gotest.tools/gotestsum@latest -- $(TAGS) -failfast ./... -timeout 120m -parallel 8
+.PHONY: fmt-prettier
+fmt-prettier: check-deps $(PRETTIER_SOURCES)
+	@echo "Formatting markup and config files..."
+	prettier --write '**/*.{ts,js,md,yaml,yml,sass,css,scss,html}'
 
-lint:
-	golangci-lint run --fix --timeout 10m
+# Linting targets
+.PHONY: lint
+lint: lint-go
 
-fmt:
-	prettier --write '**/**.{ts,js,md,yaml,yml,sass,css,scss,html}'
-	golines --max-len=88 --base-formatter=gofumpt -w $(GO_SOURCES)
-	clang-format -style="{BasedOnStyle: Google, IndentWidth: 4, AlignConsecutiveDeclarations: true, AlignConsecutiveAssignments: true, ColumnLimit: 0}" -i $(PROTO_SOURCES)
+.PHONY: lint-go
+lint-go: check-deps $(GO_SOURCES) go.mod go.sum
+	@echo "Linting Go code..."
+	golangci-lint run --timeout 10m
 
-proto-lint:
-	cd proto/ && go run github.com/bufbuild/buf/cmd/buf lint
+# Code generation
+.PHONY: generate
+generate: check-deps
+	@echo "Generating code..."
+	go generate ./...
+	$(MAKE) client
 
-compress: build
-	upx --brute headscale
+# Emit the OpenAPI spec on demand. The server serves it live at /openapi.yaml;
+# this is for external consumers or inspection and is not committed.
+.PHONY: openapi
+openapi:
+	@echo "Emitting OpenAPI spec from code..."
+	go run ./cmd/gen-openapi
 
-generate:
-	rm -rf gen
-	buf generate proto
+# Generate the strongly-typed Go HTTP clients (v1 and v2). The served specs are
+# OpenAPI 3.1, but oapi-codegen v2 does not yet read 3.1, so each client is
+# generated from a transient 3.0.3 downgrade of its document. Pinned so the
+# committed clients are reproducible.
+.PHONY: client
+client:
+	@echo "Generating API clients..."
+	@tmp=$$(mktemp -t headscale-openapi-3.0.XXXXXX.yaml); \
+	go run ./cmd/gen-openapi -downgrade "$$tmp" && \
+	go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.7.1 \
+		-generate types,client -package clientv1 -o gen/client/v1/client.gen.go "$$tmp" && \
+	go run ./cmd/gen-openapi -api v2 -downgrade "$$tmp" && \
+	go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.7.1 \
+		-generate types,client -package clientv2 -o gen/client/v2/client.gen.go "$$tmp"; \
+	status=$$?; rm -f "$$tmp"; exit $$status
+
+# Clean targets
+.PHONY: clean
+clean:
+	rm -rf headscale gen/client
+
+# Development workflow
+.PHONY: dev
+dev: fmt lint test build
+
+# Start a local headscale dev server (use mts to add nodes)
+.PHONY: dev-server
+dev-server:
+	go run ./cmd/dev
+
+# Help target
+.PHONY: help
+help:
+	@echo "Headscale Development Makefile"
+	@echo ""
+	@echo "Main targets:"
+	@echo "  all          - Run lint, test, and build (default)"
+	@echo "  build        - Build headscale binary"
+	@echo "  test         - Run Go tests"
+	@echo "  fmt          - Format all code (Go, docs, markup)"
+	@echo "  lint         - Lint all code (Go)"
+	@echo "  generate     - Generate code (go generate + client)"
+	@echo "  dev          - Full development workflow (fmt + lint + test + build)"
+	@echo "  clean        - Clean build artifacts"
+	@echo ""
+	@echo "Specific targets:"
+	@echo "  fmt-go       - Format Go code only"
+	@echo "  fmt-mdformat - Format documentation only"
+	@echo "  fmt-prettier - Format markup and config files only"
+	@echo "  lint-go      - Lint Go code only"
+	@echo ""
+	@echo "Dependencies:"
+	@echo "  check-deps   - Verify required tools are available"
+	@echo ""
+	@echo "Note: If not running in a nix shell, ensure dependencies are available:"
+	@echo "  nix develop"

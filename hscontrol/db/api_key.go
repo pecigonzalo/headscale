@@ -7,38 +7,42 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
+	"tailscale.com/util/rands"
 )
 
 const (
-	apiPrefixLength = 7
-	apiKeyLength    = 32
+	apiKeyPrefix       = "hskey-api-" //nolint:gosec // This is a prefix, not a credential
+	apiKeyPrefixLength = 12
+	apiKeyHashLength   = 64
+
+	// Legacy format constants.
+	legacyAPIPrefixLength = 7
+	legacyAPIKeyLength    = 32
 )
 
-var ErrAPIKeyFailedToParse = errors.New("failed to parse ApiKey")
+var (
+	ErrAPIKeyFailedToParse    = errors.New("failed to parse ApiKey")
+	ErrAPIKeyGenerationFailed = errors.New("failed to generate API key")
+	ErrAPIKeyExpired          = errors.New("API key expired")
+)
 
-// CreateAPIKey creates a new ApiKey in a user, and returns it.
+// CreateAPIKey creates a new [types.APIKey] in a user, and returns it.
 func (hsdb *HSDatabase) CreateAPIKey(
 	expiration *time.Time,
 ) (string, *types.APIKey, error) {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+	// Generate public prefix (12 chars)
+	prefix := rands.HexString(apiKeyPrefixLength)
 
-	prefix, err := util.GenerateRandomStringURLSafe(apiPrefixLength)
-	if err != nil {
-		return "", nil, err
-	}
+	// Generate secret (64 chars)
+	secret := rands.HexString(apiKeyHashLength)
 
-	toBeHashed, err := util.GenerateRandomStringURLSafe(apiKeyLength)
-	if err != nil {
-		return "", nil, err
-	}
+	// Full key string (shown ONCE to user)
+	keyStr := apiKeyPrefix + prefix + "-" + secret
 
-	// Key to return to user, this will only be visible _once_
-	keyStr := prefix + "." + toBeHashed
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(toBeHashed), bcrypt.DefaultCost)
+	// bcrypt hash of secret
+	hash, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
 	if err != nil {
 		return "", nil, err
 	}
@@ -49,71 +53,62 @@ func (hsdb *HSDatabase) CreateAPIKey(
 		Expiration: expiration,
 	}
 
-	if err := hsdb.db.Save(&key).Error; err != nil {
-		return "", nil, fmt.Errorf("failed to save API key to database: %w", err)
+	if err := hsdb.DB.Save(&key).Error; err != nil { //nolint:noinlineerr
+		return "", nil, fmt.Errorf("saving API key to database: %w", err)
 	}
 
 	return keyStr, &key, nil
 }
 
-// ListAPIKeys returns the list of ApiKeys for a user.
+// ListAPIKeys returns the list of [types.APIKey] values for a user.
 func (hsdb *HSDatabase) ListAPIKeys() ([]types.APIKey, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
 	keys := []types.APIKey{}
-	if err := hsdb.db.Find(&keys).Error; err != nil {
+
+	err := hsdb.DB.Find(&keys).Error
+	if err != nil {
 		return nil, err
 	}
 
 	return keys, nil
 }
 
-// GetAPIKey returns a ApiKey for a given key.
+// GetAPIKey returns a [types.APIKey] for a given key.
 func (hsdb *HSDatabase) GetAPIKey(prefix string) (*types.APIKey, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
 	key := types.APIKey{}
-	if result := hsdb.db.First(&key, "prefix = ?", prefix); result.Error != nil {
+	if result := hsdb.DB.First(&key, "prefix = ?", prefix); result.Error != nil {
 		return nil, result.Error
 	}
 
 	return &key, nil
 }
 
-// GetAPIKeyByID returns a ApiKey for a given id.
+// GetAPIKeyByID returns a [types.APIKey] for a given id.
 func (hsdb *HSDatabase) GetAPIKeyByID(id uint64) (*types.APIKey, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
 	key := types.APIKey{}
-	if result := hsdb.db.Find(&types.APIKey{ID: id}).First(&key); result.Error != nil {
+	// Query on an explicit primary-key clause: a struct condition would drop a
+	// zero-valued ID, making the lookup unconditional and returning the first
+	// row instead of not-found.
+	if result := hsdb.DB.First(&key, "id = ?", id); result.Error != nil {
 		return nil, result.Error
 	}
 
 	return &key, nil
 }
 
-// DestroyAPIKey destroys a ApiKey. Returns error if the ApiKey
+// DestroyAPIKey destroys a [types.APIKey]. Returns error if the [types.APIKey]
 // does not exist.
 func (hsdb *HSDatabase) DestroyAPIKey(key types.APIKey) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	if result := hsdb.db.Unscoped().Delete(key); result.Error != nil {
+	if result := hsdb.DB.Unscoped().Delete(key); result.Error != nil {
 		return result.Error
 	}
 
 	return nil
 }
 
-// ExpireAPIKey marks a ApiKey as expired.
+// ExpireAPIKey marks a [types.APIKey] as expired.
 func (hsdb *HSDatabase) ExpireAPIKey(key *types.APIKey) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	if err := hsdb.db.Model(&key).Update("Expiration", time.Now()).Error; err != nil {
+	err := hsdb.DB.Model(&key).Update("Expiration", time.Now()).Error
+	if err != nil {
 		return err
 	}
 
@@ -121,26 +116,148 @@ func (hsdb *HSDatabase) ExpireAPIKey(key *types.APIKey) error {
 }
 
 func (hsdb *HSDatabase) ValidateAPIKey(keyStr string) (bool, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	prefix, hash, found := strings.Cut(keyStr, ".")
-	if !found {
-		return false, ErrAPIKeyFailedToParse
-	}
-
-	key, err := hsdb.GetAPIKey(prefix)
+	key, err := validateAPIKey(hsdb.DB, keyStr)
 	if err != nil {
-		return false, fmt.Errorf("failed to validate api key: %w", err)
-	}
-
-	if key.Expiration.Before(time.Now()) {
-		return false, nil
-	}
-
-	if err := bcrypt.CompareHashAndPassword(key.Hash, []byte(hash)); err != nil {
 		return false, err
 	}
 
+	if key.Expiration != nil && key.Expiration.Before(time.Now()) {
+		return false, nil
+	}
+
 	return true, nil
+}
+
+// AuthenticateAPIKey validates keyStr and returns the matching, unexpired
+// [types.APIKey] (with its owning UserID populated). Unlike ValidateAPIKey it
+// returns the key itself, so the v2 API can act as the key's owning user. A
+// non-nil error means the key is missing, malformed, or expired.
+func (hsdb *HSDatabase) AuthenticateAPIKey(keyStr string) (*types.APIKey, error) {
+	key, err := validateAPIKey(hsdb.DB, keyStr)
+	if err != nil {
+		return nil, err
+	}
+
+	if key.Expiration != nil && key.Expiration.Before(time.Now()) {
+		return nil, ErrAPIKeyExpired
+	}
+
+	return key, nil
+}
+
+// SetAPIKeyUser sets the owning user of an API key. Used when an admin mints a
+// key on behalf of a user (headscale apikeys create --user).
+func (hsdb *HSDatabase) SetAPIKeyUser(keyID uint64, userID types.UserID) error {
+	return hsdb.DB.Model(&types.APIKey{}).
+		Where("id = ?", keyID).
+		Update("user_id", uint(userID)).Error
+}
+
+// ParseAPIKeyPrefix extracts the database prefix from a display prefix.
+// Handles formats: "hskey-api-{12chars}-***", "hskey-api-{12chars}", or just "{12chars}".
+// Returns the 12-character prefix suitable for database lookup.
+func ParseAPIKeyPrefix(displayPrefix string) (string, error) {
+	// If it's already just the 12-character prefix, return it
+	if len(displayPrefix) == apiKeyPrefixLength && isValidBase64URLSafe(displayPrefix) {
+		return displayPrefix, nil
+	}
+
+	// If it starts with the API key prefix, parse it
+	if strings.HasPrefix(displayPrefix, apiKeyPrefix) {
+		// Remove the "hskey-api-" prefix
+		_, remainder, found := strings.Cut(displayPrefix, apiKeyPrefix)
+		if !found {
+			return "", fmt.Errorf("%w: invalid display prefix format", ErrAPIKeyFailedToParse)
+		}
+
+		// Extract just the first 12 characters (the actual prefix)
+		if len(remainder) < apiKeyPrefixLength {
+			return "", fmt.Errorf("%w: prefix too short", ErrAPIKeyFailedToParse)
+		}
+
+		prefix := remainder[:apiKeyPrefixLength]
+
+		// Validate it's base64 URL-safe
+		if !isValidBase64URLSafe(prefix) {
+			return "", fmt.Errorf("%w: prefix contains invalid characters", ErrAPIKeyFailedToParse)
+		}
+
+		return prefix, nil
+	}
+
+	// For legacy 7-character prefixes or other formats, return as-is
+	return displayPrefix, nil
+}
+
+// validateAPIKey validates an API key and returns the key if valid.
+// Handles both new (hskey-api-{prefix}-{secret}) and legacy (prefix.secret) formats.
+func validateAPIKey(db *gorm.DB, keyStr string) (*types.APIKey, error) {
+	// Validate input is not empty
+	if keyStr == "" {
+		return nil, ErrAPIKeyFailedToParse
+	}
+
+	// Check for new format: hskey-api-{prefix}-{secret}
+	_, prefixAndSecret, found := strings.Cut(keyStr, apiKeyPrefix)
+
+	if !found {
+		// Legacy format: prefix.secret
+		return validateLegacyAPIKey(db, keyStr)
+	}
+
+	// New format: parse and verify
+	prefix, secret, err := parsePrefixedKey(
+		prefixAndSecret,
+		apiKeyPrefixLength,
+		apiKeyHashLength,
+		ErrAPIKeyFailedToParse,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Look up by prefix (indexed)
+	var key types.APIKey
+
+	err = db.First(&key, "prefix = ?", prefix).Error
+	if err != nil {
+		return nil, fmt.Errorf("API key not found: %w", err)
+	}
+
+	// Verify bcrypt hash
+	err = bcrypt.CompareHashAndPassword(key.Hash, []byte(secret))
+	if err != nil {
+		return nil, fmt.Errorf("invalid API key: %w", err)
+	}
+
+	return &key, nil
+}
+
+// validateLegacyAPIKey validates a legacy format API key (prefix.secret).
+func validateLegacyAPIKey(db *gorm.DB, keyStr string) (*types.APIKey, error) {
+	// Legacy format uses "." as separator
+	prefix, secret, found := strings.Cut(keyStr, ".")
+	if !found {
+		return nil, ErrAPIKeyFailedToParse
+	}
+
+	// Legacy prefix is 7 chars
+	if len(prefix) != legacyAPIPrefixLength {
+		return nil, fmt.Errorf("%w: legacy prefix length mismatch", ErrAPIKeyFailedToParse)
+	}
+
+	var key types.APIKey
+
+	err := db.First(&key, "prefix = ?", prefix).Error
+	if err != nil {
+		return nil, fmt.Errorf("API key not found: %w", err)
+	}
+
+	// Verify bcrypt (key.Hash stores bcrypt of full secret)
+	err = bcrypt.CompareHashAndPassword(key.Hash, []byte(secret))
+	if err != nil {
+		return nil, fmt.Errorf("invalid API key: %w", err)
+	}
+
+	return &key, nil
 }

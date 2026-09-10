@@ -4,175 +4,257 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # Reusable Go flake checks (build/test/lint/format); CI runs them via
+    # `nix build .#checks.<system>.<name>` instead of bespoke per-tool steps.
+    flake-checks.url = "github:kradalby/flake-checks";
+    flake-checks.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-    ...
-  }: let
-    headscaleVersion =
-      if (self ? shortRev)
-      then self.shortRev
-      else "dev";
-  in
+  outputs =
+    { self
+    , nixpkgs
+    , flake-utils
+    , flake-checks
+    , ...
+    }:
+    let
+      headscaleVersion = self.shortRev or self.dirtyShortRev;
+      commitHash = self.rev or self.dirtyRev;
+    in
     {
-      overlay = _: prev: let
-        pkgs = nixpkgs.legacyPackages.${prev.system};
-      in rec {
-        headscale = pkgs.buildGo121Module rec {
-          pname = "headscale";
-          version = headscaleVersion;
-          src = pkgs.lib.cleanSource self;
-
-          tags = ["ts2019"];
-
-          # Only run unit tests when testing a build
-          checkFlags = ["-short"];
-
-          # When updating go.mod or go.sum, a new sha will need to be calculated,
-          # update this if you have a mismatch after doing a change to thos files.
-          vendorSha256 = "sha256-Q6eySc8lXYhkWka7Y+qOM6viv7QhdjFZDX8PttaLfr4=";
-
-          ldflags = ["-s" "-w" "-X github.com/juanfont/headscale/cmd/headscale/cli.Version=v${version}"];
-        };
-
-        golines = pkgs.buildGoModule rec {
-          pname = "golines";
-          version = "0.11.0";
-
-          src = pkgs.fetchFromGitHub {
-            owner = "segmentio";
-            repo = "golines";
-            rev = "v${version}";
-            sha256 = "sha256-2K9KAg8iSubiTbujyFGN3yggrL+EDyeUCs9OOta/19A=";
-          };
-
-          vendorSha256 = "sha256-rxYuzn4ezAxaeDhxd8qdOzt+CKYIh03A9zKNdzILq18=";
-
-          nativeBuildInputs = [pkgs.installShellFiles];
-        };
-
-        golangci-lint = prev.golangci-lint.override {
-          # Override https://github.com/NixOS/nixpkgs/pull/166801 which changed this
-          # to buildGo118Module because it does not build on Darwin.
-          inherit (prev) buildGoModule;
-        };
-
-        protoc-gen-grpc-gateway = pkgs.buildGoModule rec {
-          pname = "grpc-gateway";
-          version = "2.14.0";
-
-          src = pkgs.fetchFromGitHub {
-            owner = "grpc-ecosystem";
-            repo = "grpc-gateway";
-            rev = "v${version}";
-            sha256 = "sha256-lnNdsDCpeSHtl2lC1IhUw11t3cnGF+37qSM7HDvKLls=";
-          };
-
-          vendorSha256 = "sha256-dGdnDuRbwg8fU7uB5GaHEWa/zI3w06onqjturvooJQA=";
-
-          nativeBuildInputs = [pkgs.installShellFiles];
-
-          subPackages = ["protoc-gen-grpc-gateway" "protoc-gen-openapiv2"];
-        };
+      # NixOS module
+      nixosModules = rec {
+        headscale = import ./nix/module.nix;
+        default = headscale;
       };
+
+      overlays.default = _: prev:
+        let
+          pkgs = nixpkgs.legacyPackages.${prev.stdenv.hostPlatform.system};
+          # Tracks the newest Go in nixpkgs (currently 1.27) so a Go release
+          # bump is a flake.lock update, not a flake.nix edit.
+          buildGo = pkgs.buildGoLatestModule;
+          vendorHash = (builtins.fromJSON (builtins.readFile ./flakehashes.json)).vendor.sri;
+        in
+        {
+          headscale = buildGo {
+            pname = "headscale";
+            version = headscaleVersion;
+            src = pkgs.lib.cleanSource self;
+
+            # Only run unit tests when testing a build
+            checkFlags = [ "-short" ];
+
+            # vendorHash is read from flakehashes.json; refresh via:
+            #   go run ./cmd/vendorhash update
+            inherit vendorHash;
+
+            subPackages = [ "cmd/headscale" ];
+
+            meta = {
+              mainProgram = "headscale";
+            };
+          };
+
+          hi = buildGo {
+            pname = "hi";
+            version = headscaleVersion;
+            src = pkgs.lib.cleanSource self;
+
+            checkFlags = [ "-short" ];
+            inherit vendorHash;
+
+            subPackages = [ "cmd/hi" ];
+          };
+
+          gotestsum = prev.gotestsum.override {
+            buildGoModule = buildGo;
+          };
+
+          gotests = prev.gotests.override {
+            buildGoModule = buildGo;
+          };
+
+          gofumpt = prev.gofumpt.override {
+            buildGoModule = buildGo;
+          };
+
+          golines = prev.golines.override {
+            buildGoModule = buildGo;
+          };
+
+          # goimports and friends: they parse Go with the parser of the Go
+          # they were built with, so an older one rejects new syntax.
+          gotools = prev.gotools.override {
+            buildGoModule = buildGo;
+            # goimports is wrapped with this go on PATH for module lookups.
+            go = pkgs.go_latest;
+          };
+
+          golangci-lint-langserver = prev.golangci-lint-langserver.override {
+            buildGoModule = buildGo;
+          };
+        };
     }
     // flake-utils.lib.eachDefaultSystem
-    (system: let
-      pkgs = import nixpkgs {
-        overlays = [self.overlay];
-        inherit system;
-      };
-      buildDeps = with pkgs; [git go_1_21 gnumake];
-      devDeps = with pkgs;
-        buildDeps
-        ++ [
-          golangci-lint
-          golines
-          nodePackages.prettier
-          goreleaser
-          nfpm
-          gotestsum
-          gotests
-          ksh
+      (system:
+      let
+        pkgs = import nixpkgs {
+          overlays = [ self.overlays.default ];
+          inherit system;
+        };
+        buildDeps = with pkgs; [ git go_latest gnumake ];
+        devDeps = with pkgs;
+          buildDeps
+          ++ [
+            golangci-lint
+            golangci-lint-langserver
+            golines
+            prettier
+            nixpkgs-fmt
+            goreleaser
+            nfpm
+            gotestsum
+            gotests
+            gofumpt
+            gopls
+            gotools
 
-          # 'dot' is needed for pprof graphs
-          # go tool pprof -http=: <source>
-          graphviz
+            ksh
+            ko
+            yq-go
+            ripgrep
+            postgresql
 
-          # Protobuf dependencies
-          protobuf
-          protoc-gen-go
-          protoc-gen-go-grpc
-          protoc-gen-grpc-gateway
-          buf
-          clang-tools # clang-format
-        ];
+            # External clients exercised by the Tailscale-compatible v2 API
+            # roundtrip tests (TestAPIv2). Binaries: tofu, tscli.
+            opentofu
+            tscli
+            python3Packages.mdformat
+            python3Packages.mdformat-footnote
+            python3Packages.mdformat-frontmatter
+            python3Packages.mdformat-mkdocs
+            prek
 
-      # Add entry to build a docker image with headscale
-      # caveat: only works on Linux
-      #
-      # Usage:
-      # nix build .#headscale-docker
-      # docker load < result
-      headscale-docker = pkgs.dockerTools.buildLayeredImage {
-        name = "headscale";
-        tag = headscaleVersion;
-        contents = [pkgs.headscale];
-        config.Entrypoint = [(pkgs.headscale + "/bin/headscale")];
-      };
-    in rec {
-      # `nix develop`
-      devShell = pkgs.mkShell {
-        buildInputs = devDeps;
+            # 'dot' is needed for pprof graphs
+            # go tool pprof -http=: <source>
+            graphviz
+          ]
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ traceroute ];
 
-        shellHook = ''
-          export GOFLAGS=-tags="ts2019"
-          export PATH="$PWD/result/bin:$PATH"
+        # Add entry to build a docker image with headscale
+        # caveat: only works on Linux
+        #
+        # Usage:
+        # nix build .#headscale-docker
+        # docker load < result
+        headscale-docker = pkgs.dockerTools.buildLayeredImage {
+          name = "headscale";
+          tag = headscaleVersion;
+          contents = [ pkgs.headscale ];
+          config.Entrypoint = [ (pkgs.headscale + "/bin/headscale") ];
+        };
 
-          mkdir -p ./ignored
-          export HEADSCALE_PRIVATE_KEY_PATH="./ignored/private.key"
-          export HEADSCALE_NOISE_PRIVATE_KEY_PATH="./ignored/noise_private.key"
-          export HEADSCALE_DB_PATH="./ignored/db.sqlite"
-          export HEADSCALE_TLS_LETSENCRYPT_CACHE_DIR="./ignored/cache"
-          export HEADSCALE_UNIX_SOCKET="./ignored/headscale.sock"
-        '';
-      };
+        # Go flake checks from the flake-checks library. CI gates on
+        # `nix build .#checks.<system>.<name>`; the logic lives here, not in
+        # bespoke workflow steps. Linux-only: parts of the tree are
+        # Linux-specific and the pure unit subset is validated by CI.
+        fc = flake-checks.lib;
+        common = {
+          inherit pkgs;
+          root = ./.;
+          pname = "headscale";
+          version = headscaleVersion;
+          vendorHash = (builtins.fromJSON (builtins.readFile ./flakehashes.json)).vendor.sri;
+          goPkg = pkgs.go_latest;
+          # //go:embed targets and test-read files outside the default whitelist.
+          embedDirs = [ ./hscontrol/assets ./hscontrol/db/schema.sql ./config-example.yaml ];
+          extraSrc = [
+            ./hscontrol/testdata
+            ./hscontrol/types/testdata
+            ./hscontrol/db/testdata
+            ./hscontrol/policy/v2/testdata
+          ];
+        };
+        goChecks = {
+          build = fc.goBuild (common // { subPackages = [ "cmd/headscale" ]; });
 
-      # `nix build`
-      packages = with pkgs; {
-        inherit headscale;
-        inherit headscale-docker;
-      };
-      defaultPackage = pkgs.headscale;
+          # The pure unit subset. ./integration (Docker) and
+          # ./hscontrol/servertest (slow: 10s+ convergence plus race/stress/HA
+          # property tests — run by the servertest workflow instead) are dropped
+          # from the test set but kept in source so cmd/hi and friends still
+          # compile; TestPostgres* needs a server (the SQLite equivalents still
+          # run). CGO off matches the build.
+          gotest = fc.goTest (common // {
+            testExclude = [ "/integration" "/hscontrol/servertest" ];
+            goSkip = [ "TestPostgres" ];
+            testEnv = "export CGO_ENABLED=0";
+          });
 
-      # `nix run`
-      apps.headscale = flake-utils.lib.mkApp {
-        drv = packages.headscale;
-      };
-      apps.default = apps.headscale;
+          # Full-tree golangci-lint (golines, gofumpt, etc.); uses the overlay's
+          # golangci-lint built against the pinned Go.
+          golangci-lint = fc.goLint common;
 
-      checks = {
-        format =
-          pkgs.runCommand "check-format"
-          {
-            buildInputs = with pkgs; [
-              gnumake
-              nixpkgs-fmt
-              golangci-lint
-              nodePackages.prettier
-              golines
-              clang-tools
+          # nixpkgs-fmt + prettier, excluding generated output. goFmt = "off":
+          # Go formatting (golines, gofumpt) is enforced by the golangci-lint
+          # check, not treefmt. prettierExts matches the old prettier-lint glob
+          # (no json: testdata fixtures are hand-formatted).
+          formatting = fc.goFormat (common // {
+            goFmt = "off";
+            prettier = true;
+            prettierExts = [ "ts" "js" "md" "yaml" "yml" "sass" "css" "scss" "html" ];
+            # Mirror .prettierignore (docs/ are mkdocs-flavoured; gen/ generated).
+            fmtExclude = [ ./gen ./docs ];
+          });
+        };
+      in
+      {
+        # `nix develop`
+        devShells.default = pkgs.mkShell {
+          buildInputs =
+            devDeps
+            ++ [
+              (pkgs.writeShellScriptBin
+                "nix-vendor-sri"
+                ''
+                  set -eu
+                  exec go run ./cmd/vendorhash update "$@"
+                '')
+
+              (pkgs.writeShellScriptBin
+                "go-mod-update-all"
+                ''
+                  cat go.mod | ${pkgs.ripgrep}/bin/rg "\t" | ${pkgs.ripgrep}/bin/rg -v '^\s*//' | ${pkgs.ripgrep}/bin/rg -v indirect | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.findutils}/bin/xargs go get -u
+                  go mod tidy
+                '')
             ];
-          } ''
-            ${pkgs.nixpkgs-fmt}/bin/nixpkgs-fmt ${./.}
-            ${pkgs.golangci-lint}/bin/golangci-lint run --fix --timeout 10m
-            ${pkgs.nodePackages.prettier}/bin/prettier --write '**/**.{ts,js,md,yaml,yml,sass,css,scss,html}'
-            ${pkgs.golines}/bin/golines --max-len=88 --base-formatter=gofumpt -w ${./.}
-            ${pkgs.clang-tools}/bin/clang-format -style="{BasedOnStyle: Google, IndentWidth: 4, AlignConsecutiveDeclarations: true, AlignConsecutiveAssignments: true, ColumnLimit: 0}" -i ${./.}
+
+          shellHook = ''
+            export PATH="$PWD/result/bin:$PATH"
+            export CGO_ENABLED=0
           '';
-      };
-    });
+        };
+
+        # `nix build`
+        packages = with pkgs; {
+          inherit headscale;
+          inherit headscale-docker;
+          default = headscale;
+        };
+
+        # `nix run`
+        apps.headscale = flake-utils.lib.mkApp {
+          drv = pkgs.headscale;
+        };
+        apps.default = flake-utils.lib.mkApp {
+          drv = pkgs.headscale;
+        };
+
+        checks = {
+          headscale = pkgs.testers.nixosTest (import ./nix/tests/headscale.nix);
+        }
+        # The Go build/test checks are gated to Linux: parts of the tree are
+        # Linux-specific and the pure unit subset is validated by CI.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux goChecks;
+      });
 }

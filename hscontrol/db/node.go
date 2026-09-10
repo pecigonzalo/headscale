@@ -1,26 +1,44 @@
 package db
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/netip"
-	"sort"
-	"strings"
+	"slices"
+	"strconv"
+	"sync"
+	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/patrickmn/go-cache"
+	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
-	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/util/dnsname"
 )
 
 const (
 	NodeGivenNameHashLength = 8
 	NodeGivenNameTrimSize   = 2
+
+	// defaultTestNodePrefix is the default hostname prefix for nodes created in tests.
+	defaultTestNodePrefix = "testnode"
 )
+
+// ErrNodeNameNotUnique is returned when a node name is not unique.
+var ErrNodeNameNotUnique = errors.New("node name is not unique")
+
+// preloadNode returns a session that eager-loads a node's AuthKey, the
+// AuthKey's User, and the node's User.
+func preloadNode(tx *gorm.DB) *gorm.DB {
+	return tx.
+		Preload("AuthKey").
+		Preload("AuthKey.User").
+		Preload("User")
+}
 
 var (
 	ErrNodeNotFound                  = errors.New("node not found")
@@ -29,849 +47,638 @@ var (
 		"node not found in registration cache",
 	)
 	ErrCouldNotConvertNodeInterface = errors.New("failed to convert node interface")
-	ErrDifferentRegisteredUser      = errors.New(
-		"node was previously registered with a different user",
-	)
 )
 
-// ListPeers returns all peers of node, regardless of any Policy or if the node is expired.
-func (hsdb *HSDatabase) ListPeers(node *types.Node) (types.Nodes, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.listPeers(node)
+// ListPeers returns peers of node, regardless of any Policy or if the node is expired.
+// If no peer IDs are given, all peers are returned.
+// If at least one peer ID is given, only these peer nodes will be returned.
+func (hsdb *HSDatabase) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) (types.Nodes, error) {
+	return ListPeers(hsdb.DB, nodeID, peerIDs...)
 }
 
-func (hsdb *HSDatabase) listPeers(node *types.Node) (types.Nodes, error) {
-	log.Trace().
-		Caller().
-		Str("node", node.Hostname).
-		Msg("Finding direct peers")
-
+// ListPeers returns peers of node, regardless of any Policy or if the node is expired.
+// If no peer IDs are given, all peers are returned.
+// If at least one peer ID is given, only these peer nodes will be returned.
+func ListPeers(tx *gorm.DB, nodeID types.NodeID, peerIDs ...types.NodeID) (types.Nodes, error) {
 	nodes := types.Nodes{}
-	if err := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		Where("node_key <> ?",
-			node.NodeKey).Find(&nodes).Error; err != nil {
+
+	err := preloadNode(tx).
+		Where("id <> ?", nodeID).
+		Where(peerIDs).Find(&nodes).Error
+	if err != nil {
 		return types.Nodes{}, err
 	}
 
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
-
-	log.Trace().
-		Caller().
-		Str("node", node.Hostname).
-		Msgf("Found peers: %s", nodes.String())
+	slices.SortFunc(nodes, func(a, b *types.Node) int { return cmp.Compare(a.ID, b.ID) })
 
 	return nodes, nil
 }
 
-func (hsdb *HSDatabase) ListNodes() ([]types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.listNodes()
+// ListNodes queries the database for either all nodes if no parameters are given
+// or for the given nodes if at least one node ID is given as parameter.
+func (hsdb *HSDatabase) ListNodes(nodeIDs ...types.NodeID) (types.Nodes, error) {
+	return ListNodes(hsdb.DB, nodeIDs...)
 }
 
-func (hsdb *HSDatabase) listNodes() ([]types.Node, error) {
-	nodes := []types.Node{}
-	if err := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		Find(&nodes).Error; err != nil {
-		return nil, err
-	}
-
-	return nodes, nil
-}
-
-func (hsdb *HSDatabase) ListNodesByGivenName(givenName string) (types.Nodes, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.listNodesByGivenName(givenName)
-}
-
-func (hsdb *HSDatabase) listNodesByGivenName(givenName string) (types.Nodes, error) {
+// ListNodes queries the database for either all nodes if no parameters are given
+// or for the given nodes if at least one node ID is given as parameter.
+func ListNodes(tx *gorm.DB, nodeIDs ...types.NodeID) (types.Nodes, error) {
 	nodes := types.Nodes{}
-	if err := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		Where("given_name = ?", givenName).Find(&nodes).Error; err != nil {
-		return nil, err
-	}
 
-	return nodes, nil
-}
-
-// GetNode finds a Node by name and user and returns the Node struct.
-func (hsdb *HSDatabase) GetNode(user string, name string) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	nodes, err := hsdb.ListNodesByUser(user)
+	err := preloadNode(tx).
+		Where(nodeIDs).Find(&nodes).Error
 	if err != nil {
 		return nil, err
 	}
 
-	for _, m := range nodes {
-		if m.Hostname == name {
-			return m, nil
-		}
-	}
-
-	return nil, ErrNodeNotFound
+	return nodes, nil
 }
 
-// GetNodeByGivenName finds a Node by given name and user and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByGivenName(
-	user string,
-	givenName string,
-) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
+func (hsdb *HSDatabase) ListEphemeralNodes() (types.Nodes, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (types.Nodes, error) {
+		nodes := types.Nodes{}
+
+		err := rx.Joins("AuthKey").Where(`"AuthKey"."ephemeral" = true`).Find(&nodes).Error
+		if err != nil {
+			return nil, err
+		}
+
+		return nodes, nil
+	})
+}
+
+func (hsdb *HSDatabase) getNode(uid types.UserID, name string) (*types.Node, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (*types.Node, error) {
+		return getNode(rx, uid, name)
+	})
+}
+
+// getNode finds a [types.Node] by name and user and returns the [types.Node] struct.
+func getNode(tx *gorm.DB, uid types.UserID, name string) (*types.Node, error) {
+	uidPtr := uint(uid)
 
 	node := types.Node{}
-	if err := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		Where("given_name = ?", givenName).First(&node).Error; err != nil {
+
+	err := preloadNode(tx).
+		Where(&types.Node{UserID: &uidPtr, Hostname: name}).
+		First(&node).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNodeNotFound
+		}
+
 		return nil, err
 	}
 
-	return nil, ErrNodeNotFound
+	return &node, nil
 }
 
-// GetNodeByID finds a Node by ID and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByID(id uint64) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
+func (hsdb *HSDatabase) GetNodeByID(id types.NodeID) (*types.Node, error) {
+	return GetNodeByID(hsdb.DB, id)
+}
 
+// GetNodeByID finds a [types.Node] by ID and returns the [types.Node] struct.
+func GetNodeByID(tx *gorm.DB, id types.NodeID) (*types.Node, error) {
 	mach := types.Node{}
-	if result := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		Find(&types.Node{ID: id}).First(&mach); result.Error != nil {
+	if result := preloadNode(tx).
+		First(&mach, "id = ?", id); result.Error != nil {
 		return nil, result.Error
 	}
 
 	return &mach, nil
 }
 
-// GetNodeByMachineKey finds a Node by its MachineKey and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByMachineKey(
-	machineKey key.MachinePublic,
-) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	mach := types.Node{}
-	if result := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		First(&mach, "machine_key = ?", util.MachinePublicKeyStripPrefix(machineKey)); result.Error != nil {
-		return nil, result.Error
-	}
-
-	return &mach, nil
+func (hsdb *HSDatabase) GetNodeByNodeKey(nodeKey key.NodePublic) (*types.Node, error) {
+	return GetNodeByNodeKey(hsdb.DB, nodeKey)
 }
 
-// GetNodeByNodeKey finds a Node by its current NodeKey.
-func (hsdb *HSDatabase) GetNodeByNodeKey(
+// GetNodeByNodeKey finds a [types.Node] by its [key.NodePublic] and returns the [types.Node] struct.
+func GetNodeByNodeKey(
+	tx *gorm.DB,
 	nodeKey key.NodePublic,
 ) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	node := types.Node{}
-	if result := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		First(&node, "node_key = ?",
-			util.NodePublicKeyStripPrefix(nodeKey)); result.Error != nil {
+	mach := types.Node{}
+	if result := preloadNode(tx).
+		First(&mach, "node_key = ?", nodeKey.String()); result.Error != nil {
 		return nil, result.Error
 	}
 
-	return &node, nil
+	return &mach, nil
 }
 
-// GetNodeByAnyKey finds a Node by its MachineKey, its current NodeKey or the old one, and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByAnyKey(
-	machineKey key.MachinePublic, nodeKey key.NodePublic, oldNodeKey key.NodePublic,
-) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	node := types.Node{}
-	if result := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		First(&node, "machine_key = ? OR node_key = ? OR node_key = ?",
-			util.MachinePublicKeyStripPrefix(machineKey),
-			util.NodePublicKeyStripPrefix(nodeKey),
-			util.NodePublicKeyStripPrefix(oldNodeKey)); result.Error != nil {
-		return nil, result.Error
-	}
-
-	return &node, nil
-}
-
-func (hsdb *HSDatabase) NodeReloadFromDatabase(node *types.Node) error {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	if result := hsdb.db.Find(node).First(&node); result.Error != nil {
-		return result.Error
-	}
-
-	return nil
-}
-
-// SetTags takes a Node struct pointer and update the forced tags.
-func (hsdb *HSDatabase) SetTags(
-	node *types.Node,
-	tags []string,
-) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	newTags := []string{}
-	for _, tag := range tags {
-		if !util.StringOrPrefixListContains(newTags, tag) {
-			newTags = append(newTags, tag)
-		}
-	}
-
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		ForcedTags: newTags,
-	}).Error; err != nil {
-		return fmt.Errorf("failed to update tags for node in the database: %w", err)
-	}
-
-	hsdb.notifier.NotifyWithIgnore(types.StateUpdate{
-		Type:    types.StatePeerChanged,
-		Changed: types.Nodes{node},
-	}, node.MachineKey)
-
-	return nil
-}
-
-// RenameNode takes a Node struct and a new GivenName for the nodes
-// and renames it.
-func (hsdb *HSDatabase) RenameNode(node *types.Node, newName string) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	err := util.CheckForFQDNRules(
-		newName,
-	)
-	if err != nil {
-		log.Error().
-			Caller().
-			Str("func", "RenameNode").
-			Str("node", node.Hostname).
-			Str("newName", newName).
-			Err(err).
-			Msg("failed to rename node")
-
-		return err
-	}
-	node.GivenName = newName
-
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		GivenName: newName,
-	}).Error; err != nil {
-		return fmt.Errorf("failed to rename node in the database: %w", err)
-	}
-
-	hsdb.notifier.NotifyWithIgnore(types.StateUpdate{
-		Type:    types.StatePeerChanged,
-		Changed: types.Nodes{node},
-	}, node.MachineKey)
-
-	return nil
-}
-
-// NodeSetExpiry takes a Node struct and  a new expiry time.
-func (hsdb *HSDatabase) NodeSetExpiry(node *types.Node, expiry time.Time) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	return hsdb.nodeSetExpiry(node, expiry)
-}
-
-func (hsdb *HSDatabase) nodeSetExpiry(node *types.Node, expiry time.Time) error {
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		Expiry: &expiry,
-	}).Error; err != nil {
-		return fmt.Errorf(
-			"failed to refresh node (update expiration) in the database: %w",
-			err,
-		)
-	}
-
-	hsdb.notifier.NotifyWithIgnore(types.StateUpdate{
-		Type:    types.StatePeerChanged,
-		Changed: types.Nodes{node},
-	}, node.MachineKey)
-
-	return nil
-}
-
-// DeleteNode deletes a Node from the database.
-func (hsdb *HSDatabase) DeleteNode(node *types.Node) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	return hsdb.deleteNode(node)
-}
-
-func (hsdb *HSDatabase) deleteNode(node *types.Node) error {
-	err := hsdb.deleteNodeRoutes(node)
-	if err != nil {
-		return err
-	}
-
-	// Unscoped causes the node to be fully removed from the database.
-	if err := hsdb.db.Unscoped().Delete(&node).Error; err != nil {
-		return err
-	}
-
-	hsdb.notifier.NotifyAll(types.StateUpdate{
-		Type:    types.StatePeerRemoved,
-		Removed: []tailcfg.NodeID{tailcfg.NodeID(node.ID)},
-	})
-
-	return nil
-}
-
-// UpdateLastSeen sets a node's last seen field indicating that we
+// SetLastSeen sets a node's last seen field indicating that we
 // have recently communicating with this node.
-// This is mostly used to indicate if a node is online and is not
-// extremely important to make sure is fully correct and to avoid
-// holding up the hot path, does not contain any locks and isnt
-// concurrency safe. But that should be ok.
-func (hsdb *HSDatabase) UpdateLastSeen(node *types.Node) error {
-	return hsdb.db.Model(node).Updates(types.Node{
-		LastSeen: node.LastSeen,
-	}).Error
+func (hsdb *HSDatabase) SetLastSeen(nodeID types.NodeID, lastSeen time.Time) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return SetLastSeen(tx, nodeID, lastSeen)
+	})
 }
 
-func (hsdb *HSDatabase) RegisterNodeFromAuthCallback(
-	cache *cache.Cache,
-	nodeKeyStr string,
-	userName string,
-	nodeExpiry *time.Time,
-	registrationMethod string,
-) (*types.Node, error) {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+// SetLastSeen sets a node's last seen field indicating that we
+// have recently communicating with this node.
+func SetLastSeen(tx *gorm.DB, nodeID types.NodeID, lastSeen time.Time) error {
+	return tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("last_seen", lastSeen).Error
+}
 
-	nodeKey := key.NodePublic{}
-	err := nodeKey.UnmarshalText([]byte(nodeKeyStr))
+// RenameNode takes a [types.Node] struct and a new [types.Node.GivenName] for the nodes
+// and renames it. Validation should be done in the state layer before calling this function.
+func RenameNode(tx *gorm.DB,
+	nodeID types.NodeID, newName string,
+) error {
+	err := dnsname.ValidLabel(newName)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("renaming node: %w", err)
 	}
 
-	log.Debug().
-		Str("nodeKey", nodeKey.ShortString()).
-		Str("userName", userName).
-		Str("registrationMethod", registrationMethod).
-		Str("expiresAt", fmt.Sprintf("%v", nodeExpiry)).
-		Msg("Registering node from API/CLI or auth callback")
+	// Check if the new name is unique
+	var count int64
 
-	if nodeInterface, ok := cache.Get(util.NodePublicKeyStripPrefix(nodeKey)); ok {
-		if registrationNode, ok := nodeInterface.(types.Node); ok {
-			user, err := hsdb.getUser(userName)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"failed to find user in register node from auth callback, %w",
-					err,
-				)
-			}
+	if err := tx.Model(&types.Node{}).Where("given_name = ? AND id != ?", newName, nodeID).Count(&count).Error; err != nil { //nolint:noinlineerr
+		return fmt.Errorf("checking name uniqueness: %w", err)
+	}
 
-			// Registration of expired node with different user
-			if registrationNode.ID != 0 &&
-				registrationNode.UserID != user.ID {
-				return nil, ErrDifferentRegisteredUser
-			}
+	if count > 0 {
+		return ErrNodeNameNotUnique
+	}
 
-			registrationNode.UserID = user.ID
-			registrationNode.RegisterMethod = registrationMethod
+	if err := tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("given_name", newName).Error; err != nil { //nolint:noinlineerr
+		return fmt.Errorf("renaming node in database: %w", err)
+	}
 
-			if nodeExpiry != nil {
-				registrationNode.Expiry = nodeExpiry
-			}
+	return nil
+}
 
-			node, err := hsdb.registerNode(
-				registrationNode,
-			)
+func (hsdb *HSDatabase) NodeSetExpiry(nodeID types.NodeID, expiry *time.Time) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return NodeSetExpiry(tx, nodeID, expiry)
+	})
+}
 
-			if err == nil {
-				cache.Delete(nodeKeyStr)
-			}
+// NodeSetExpiry sets a new expiry time for a node.
+// If expiry is nil, the node's expiry is disabled (node will never expire).
+func NodeSetExpiry(tx *gorm.DB, nodeID types.NodeID, expiry *time.Time) error {
+	return tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("expiry", expiry).Error
+}
 
-			return node, err
-		} else {
-			return nil, ErrCouldNotConvertNodeInterface
+func (hsdb *HSDatabase) DeleteNode(node *types.Node) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return DeleteNode(tx, node)
+	})
+}
+
+// DeleteNode deletes a [types.Node] from the database.
+// Caller is responsible for notifying all of change.
+func DeleteNode(tx *gorm.DB,
+	node *types.Node,
+) error {
+	// Unscoped causes the node to be fully removed from the database.
+	err := tx.Unscoped().Delete(&types.Node{}, node.ID).Error
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DeleteEphemeralNode deletes a [types.Node] from the database, note that this method
+// will remove it straight, and not notify any changes or consider any routes.
+// It is intended for Ephemeral nodes.
+func (hsdb *HSDatabase) DeleteEphemeralNode(
+	nodeID types.NodeID,
+) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		err := tx.Unscoped().Delete(&types.Node{}, nodeID).Error
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+// RegisterNodeForTest is used only for testing purposes to register a node directly in the database.
+// Production code should use [state.State.HandleNodeFromAuthPath] or [state.State.HandleNodeFromPreAuthKey].
+func RegisterNodeForTest(tx *gorm.DB, node types.Node, ipv4 *netip.Addr, ipv6 *netip.Addr) (*types.Node, error) {
+	if !testing.Testing() {
+		panic("RegisterNodeForTest can only be called during tests")
+	}
+
+	logEvent := log.Debug().
+		Str(zf.NodeHostname, node.Hostname).
+		Str(zf.MachineKey, node.MachineKey.ShortString()).
+		Str(zf.NodeKey, node.NodeKey.ShortString())
+
+	if node.User != nil {
+		logEvent = logEvent.Str(zf.UserName, node.User.Username())
+	} else if node.UserID != nil {
+		logEvent = logEvent.Uint(zf.UserID, *node.UserID)
+	} else {
+		logEvent = logEvent.Str(zf.UserName, "none")
+	}
+
+	logEvent.Msg("registering test node")
+
+	// Reuse the existing node's identity only when the same machine
+	// re-registers for the same user; a different user is a new node. Match on
+	// (machine_key, user_id) precisely - a machine key can map to several nodes
+	// (one per user), so a machine-key-only lookup would be ambiguous.
+	var oldNode types.Node
+
+	err := tx.
+		Where("machine_key = ? AND user_id = ?", node.MachineKey.String(), node.UserID).
+		First(&oldNode).Error
+	if err == nil {
+		node.ID = oldNode.ID
+		node.GivenName = oldNode.GivenName
+		node.ApprovedRoutes = oldNode.ApprovedRoutes
+		// Don't overwrite the provided IPs with old ones when they exist
+		if ipv4 == nil {
+			ipv4 = oldNode.IPv4
+		}
+
+		if ipv6 == nil {
+			ipv6 = oldNode.IPv6
 		}
 	}
 
-	return nil, ErrNodeNotFoundRegistrationCache
-}
-
-// RegisterNode is executed from the CLI to register a new Node using its MachineKey.
-func (hsdb *HSDatabase) RegisterNode(node types.Node) (*types.Node, error) {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	return hsdb.registerNode(node)
-}
-
-func (hsdb *HSDatabase) registerNode(node types.Node) (*types.Node, error) {
-	log.Debug().
-		Str("node", node.Hostname).
-		Str("machine_key", node.MachineKey).
-		Str("node_key", node.NodeKey).
-		Str("user", node.User.Name).
-		Msg("Registering node")
-
-	// If the node exists and we had already IPs for it, we just save it
+	// If the node exists and it already has IP(s), we just save it
 	// so we store the node.Expire and node.Nodekey that has been set when
 	// adding it to the registrationCache
-	if len(node.IPAddresses) > 0 {
-		if err := hsdb.db.Save(&node).Error; err != nil {
-			return nil, fmt.Errorf("failed register existing node in the database: %w", err)
+	if node.IPv4 != nil || node.IPv6 != nil {
+		err := tx.Save(&node).Error
+		if err != nil {
+			return nil, fmt.Errorf("registering existing node in database: %w", err)
 		}
 
 		log.Trace().
 			Caller().
-			Str("node", node.Hostname).
-			Str("machine_key", node.MachineKey).
-			Str("node_key", node.NodeKey).
-			Str("user", node.User.Name).
-			Msg("Node authorized again")
+			Str(zf.NodeHostname, node.Hostname).
+			Str(zf.MachineKey, node.MachineKey.ShortString()).
+			Str(zf.NodeKey, node.NodeKey.ShortString()).
+			Str(zf.UserName, node.User.Username()).
+			Msg("Test node authorized again")
 
 		return &node, nil
 	}
 
-	hsdb.ipAllocationMutex.Lock()
-	defer hsdb.ipAllocationMutex.Unlock()
+	node.IPv4 = ipv4
+	node.IPv6 = ipv6
 
-	ips, err := hsdb.getAvailableIPs()
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("node", node.Hostname).
-			Msg("Could not find IP for the new node")
-
-		return nil, err
+	if node.GivenName == "" {
+		node.GivenName = dnsname.SanitizeHostname(node.Hostname)
+		if node.GivenName == "" {
+			node.GivenName = "node"
+		}
 	}
 
-	node.IPAddresses = ips
-
-	if err := hsdb.db.Save(&node).Error; err != nil {
-		return nil, fmt.Errorf("failed register(save) node in the database: %w", err)
+	if err := tx.Save(&node).Error; err != nil { //nolint:noinlineerr
+		return nil, fmt.Errorf("saving node to database: %w", err)
 	}
 
 	log.Trace().
 		Caller().
-		Str("node", node.Hostname).
-		Str("ip", strings.Join(ips.StringSlice(), ",")).
-		Msg("Node registered with the database")
+		Str(zf.NodeHostname, node.Hostname).
+		Msg("Test node registered with the database")
 
 	return &node, nil
 }
 
 // NodeSetNodeKey sets the node key of a node and saves it to the database.
-func (hsdb *HSDatabase) NodeSetNodeKey(node *types.Node, nodeKey key.NodePublic) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		NodeKey: util.NodePublicKeyStripPrefix(nodeKey),
-	}).Error; err != nil {
-		return err
-	}
-
-	return nil
+func NodeSetNodeKey(tx *gorm.DB, node *types.Node, nodeKey key.NodePublic) error {
+	return tx.Model(node).Updates(types.Node{
+		NodeKey: nodeKey,
+	}).Error
 }
 
-// NodeSetMachineKey sets the node key of a node and saves it to the database.
 func (hsdb *HSDatabase) NodeSetMachineKey(
 	node *types.Node,
 	machineKey key.MachinePublic,
 ) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		MachineKey: util.MachinePublicKeyStripPrefix(machineKey),
-	}).Error; err != nil {
-		return err
-	}
-
-	return nil
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return NodeSetMachineKey(tx, node, machineKey)
+	})
 }
 
-// NodeSave saves a node object to the database, prefer to use a specific save method rather
-// than this. It is intended to be used when we are changing or.
-func (hsdb *HSDatabase) NodeSave(node *types.Node) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	if err := hsdb.db.Save(node).Error; err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// GetAdvertisedRoutes returns the routes that are be advertised by the given node.
-func (hsdb *HSDatabase) GetAdvertisedRoutes(node *types.Node) ([]netip.Prefix, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.getAdvertisedRoutes(node)
-}
-
-func (hsdb *HSDatabase) getAdvertisedRoutes(node *types.Node) ([]netip.Prefix, error) {
-	routes := types.Routes{}
-
-	err := hsdb.db.
-		Preload("Node").
-		Where("node_id = ? AND advertised = ?", node.ID, true).Find(&routes).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("node", node.Hostname).
-			Msg("Could not get advertised routes for node")
-
-		return nil, err
-	}
-
-	prefixes := []netip.Prefix{}
-	for _, route := range routes {
-		prefixes = append(prefixes, netip.Prefix(route.Prefix))
-	}
-
-	return prefixes, nil
-}
-
-// GetEnabledRoutes returns the routes that are enabled for the node.
-func (hsdb *HSDatabase) GetEnabledRoutes(node *types.Node) ([]netip.Prefix, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.getEnabledRoutes(node)
-}
-
-func (hsdb *HSDatabase) getEnabledRoutes(node *types.Node) ([]netip.Prefix, error) {
-	routes := types.Routes{}
-
-	err := hsdb.db.
-		Preload("Node").
-		Where("node_id = ? AND advertised = ? AND enabled = ?", node.ID, true, true).
-		Find(&routes).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("node", node.Hostname).
-			Msg("Could not get enabled routes for node")
-
-		return nil, err
-	}
-
-	prefixes := []netip.Prefix{}
-	for _, route := range routes {
-		prefixes = append(prefixes, netip.Prefix(route.Prefix))
-	}
-
-	return prefixes, nil
-}
-
-func (hsdb *HSDatabase) IsRoutesEnabled(node *types.Node, routeStr string) bool {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	route, err := netip.ParsePrefix(routeStr)
-	if err != nil {
-		return false
-	}
-
-	enabledRoutes, err := hsdb.getEnabledRoutes(node)
-	if err != nil {
-		log.Error().Err(err).Msg("Could not get enabled routes")
-
-		return false
-	}
-
-	for _, enabledRoute := range enabledRoutes {
-		if route == enabledRoute {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (hsdb *HSDatabase) ListOnlineNodes(
+// NodeSetMachineKey sets the node key of a node and saves it to the database.
+func NodeSetMachineKey(
+	tx *gorm.DB,
 	node *types.Node,
-) (map[tailcfg.NodeID]bool, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	peers, err := hsdb.listPeers(node)
-	if err != nil {
-		return nil, err
-	}
-
-	return peers.OnlineNodeMap(), nil
+	machineKey key.MachinePublic,
+) error {
+	return tx.Model(node).Updates(types.Node{
+		MachineKey: machineKey,
+	}).Error
 }
 
-// enableRoutes enables new routes based on a list of new routes.
-func (hsdb *HSDatabase) enableRoutes(node *types.Node, routeStrs ...string) error {
-	newRoutes := make([]netip.Prefix, len(routeStrs))
-	for index, routeStr := range routeStrs {
-		route, err := netip.ParsePrefix(routeStr)
-		if err != nil {
-			return err
-		}
+// EphemeralGarbageCollector is a garbage collector that will delete nodes after
+// a certain amount of time.
+// It is used to delete ephemeral nodes ([types.Node.IsEphemeral]) that have disconnected and should be
+// cleaned up.
+type EphemeralGarbageCollector struct {
+	mu sync.Mutex
 
-		newRoutes[index] = route
-	}
+	deleteFunc  func(types.NodeID)
+	toBeDeleted map[types.NodeID]ephemeralTimer
+	// gen is bumped for every scheduled deletion so a queued deletion that
+	// was superseded by a Cancel or reschedule can be recognised and dropped.
+	gen uint64
 
-	advertisedRoutes, err := hsdb.getAdvertisedRoutes(node)
-	if err != nil {
-		return err
-	}
-
-	for _, newRoute := range newRoutes {
-		if !util.StringOrPrefixListContains(advertisedRoutes, newRoute) {
-			return fmt.Errorf(
-				"route (%s) is not available on node %s: %w",
-				node.Hostname,
-				newRoute, ErrNodeRouteIsNotAvailable,
-			)
-		}
-	}
-
-	// Separate loop so we don't leave things in a half-updated state
-	for _, prefix := range newRoutes {
-		route := types.Route{}
-		err := hsdb.db.Preload("Node").
-			Where("node_id = ? AND prefix = ?", node.ID, types.IPPrefix(prefix)).
-			First(&route).Error
-		if err == nil {
-			route.Enabled = true
-
-			// Mark already as primary if there is only this node offering this subnet
-			// (and is not an exit route)
-			if !route.IsExitRoute() {
-				route.IsPrimary = hsdb.isUniquePrefix(route)
-			}
-
-			err = hsdb.db.Save(&route).Error
-			if err != nil {
-				return fmt.Errorf("failed to enable route: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to find route: %w", err)
-		}
-	}
-
-	hsdb.notifier.NotifyWithIgnore(types.StateUpdate{
-		Type:    types.StatePeerChanged,
-		Changed: types.Nodes{node},
-	}, node.MachineKey)
-
-	return nil
+	deleteCh chan pendingDeletion
+	cancelCh chan struct{}
 }
 
-func generateGivenName(suppliedName string, randomSuffix bool) (string, error) {
-	normalizedHostname, err := util.NormalizeToFQDNRulesConfigFromViper(
-		suppliedName,
-	)
-	if err != nil {
-		return "", err
-	}
-
-	if randomSuffix {
-		// Trim if a hostname will be longer than 63 chars after adding the hash.
-		trimmedHostnameLength := util.LabelHostnameLength - NodeGivenNameHashLength - NodeGivenNameTrimSize
-		if len(normalizedHostname) > trimmedHostnameLength {
-			normalizedHostname = normalizedHostname[:trimmedHostnameLength]
-		}
-
-		suffix, err := util.GenerateRandomStringDNSSafe(NodeGivenNameHashLength)
-		if err != nil {
-			return "", err
-		}
-
-		normalizedHostname += "-" + suffix
-	}
-
-	return normalizedHostname, nil
+// ephemeralTimer pairs a node's pending-deletion timer with a done channel
+// used to reap its watcher goroutine on Cancel or reschedule, plus the
+// generation identifying this particular scheduling. Without the done channel
+// a stopped timer never fires and the goroutine leaks until Close.
+type ephemeralTimer struct {
+	timer *time.Timer
+	done  chan struct{}
+	gen   uint64
 }
 
-func (hsdb *HSDatabase) GenerateGivenName(machineKey string, suppliedName string) (string, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	givenName, err := generateGivenName(suppliedName, false)
-	if err != nil {
-		return "", err
-	}
-
-	// Tailscale rules (may differ) https://tailscale.com/kb/1098/machine-names/
-	nodes, err := hsdb.listNodesByGivenName(givenName)
-	if err != nil {
-		return "", err
-	}
-
-	for _, node := range nodes {
-		if node.MachineKey != machineKey && node.GivenName == givenName {
-			postfixedName, err := generateGivenName(suppliedName, true)
-			if err != nil {
-				return "", err
-			}
-
-			givenName = postfixedName
-		}
-	}
-
-	return givenName, nil
+// pendingDeletion is the generation-stamped deletion a watcher enqueues when
+// its timer fires. Start drops it if the node's current generation no longer
+// matches, i.e. it was cancelled or rescheduled in the meantime.
+type pendingDeletion struct {
+	nodeID types.NodeID
+	gen    uint64
 }
 
-func (hsdb *HSDatabase) ExpireEphemeralNodes(inactivityThreshhold time.Duration) {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+// NewEphemeralGarbageCollector creates a new [EphemeralGarbageCollector], it takes
+// a deleteFunc that will be called when a node is scheduled for deletion.
+func NewEphemeralGarbageCollector(deleteFunc func(types.NodeID)) *EphemeralGarbageCollector {
+	return &EphemeralGarbageCollector{
+		toBeDeleted: make(map[types.NodeID]ephemeralTimer),
+		deleteCh:    make(chan pendingDeletion, 10),
+		cancelCh:    make(chan struct{}),
+		deleteFunc:  deleteFunc,
+	}
+}
 
-	users, err := hsdb.listUsers()
-	if err != nil {
-		log.Error().Err(err).Msg("Error listing users")
+// Close stops the garbage collector.
+func (e *EphemeralGarbageCollector) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
+	// Stop all timers
+	for _, t := range e.toBeDeleted {
+		t.timer.Stop()
+	}
+
+	// Close the cancel channel to signal all goroutines to exit
+	close(e.cancelCh)
+}
+
+// Schedule schedules a node for deletion after the expiry duration.
+// If the garbage collector is already closed, this is a no-op.
+func (e *EphemeralGarbageCollector) Schedule(nodeID types.NodeID, expiry time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Don't schedule new timers if the garbage collector is already closed
+	select {
+	case <-e.cancelCh:
+		// The cancel channel is closed, meaning the GC is shutting down
+		// or already shut down, so we shouldn't schedule anything new
 		return
+	default:
+		// Continue with scheduling
 	}
 
-	for _, user := range users {
-		nodes, err := hsdb.listNodesByUser(user.Name)
-		if err != nil {
-			log.Error().
-				Err(err).
-				Str("user", user.Name).
-				Msg("Error listing nodes in user")
+	// If a timer already exists for this node, stop it and reap its
+	// watcher goroutine before scheduling a fresh one.
+	if old, exists := e.toBeDeleted[nodeID]; exists {
+		old.timer.Stop()
+		close(old.done)
+	}
 
+	e.gen++
+	gen := e.gen
+	timer := time.NewTimer(expiry)
+	done := make(chan struct{})
+	e.toBeDeleted[nodeID] = ephemeralTimer{timer: timer, done: done, gen: gen}
+	// Start a goroutine to handle the timer completion
+	go func() {
+		select {
+		case <-timer.C:
+			// This is to handle the situation where the GC is shutting down and
+			// we are trying to schedule a new node for deletion at the same time
+			// i.e. We don't want to send to deleteCh if the GC is shutting down
+			// So, we try to send to deleteCh, but also watch for cancelCh
+			select {
+			case e.deleteCh <- pendingDeletion{nodeID: nodeID, gen: gen}:
+				// Successfully sent to deleteCh
+			case <-e.cancelCh:
+				// GC is shutting down, don't send to deleteCh
+				return
+			case <-done:
+				// Cancelled or rescheduled before the send landed.
+				return
+			}
+		case <-done:
+			// Cancelled or rescheduled before the timer fired.
+			return
+		case <-e.cancelCh:
+			// If the GC is closed, exit the goroutine
 			return
 		}
+	}()
+}
 
-		expired := make([]tailcfg.NodeID, 0)
-		for idx, node := range nodes {
-			if node.IsEphemeral() && node.LastSeen != nil &&
-				time.Now().
-					After(node.LastSeen.Add(inactivityThreshhold)) {
-				expired = append(expired, tailcfg.NodeID(node.ID))
+// Cancel cancels the deletion of a node.
+func (e *EphemeralGarbageCollector) Cancel(nodeID types.NodeID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-				log.Info().
-					Str("node", node.Hostname).
-					Msg("Ephemeral client removed from database")
+	if t, ok := e.toBeDeleted[nodeID]; ok {
+		t.timer.Stop()
+		close(t.done)
+		delete(e.toBeDeleted, nodeID)
+	}
+}
 
-				err = hsdb.deleteNode(nodes[idx])
-				if err != nil {
-					log.Error().
-						Err(err).
-						Str("node", node.Hostname).
-						Msg("🤮 Cannot delete ephemeral node from the database")
-				}
+// IsScheduled reports whether a deletion timer is currently armed for nodeID.
+func (e *EphemeralGarbageCollector) IsScheduled(nodeID types.NodeID) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	_, ok := e.toBeDeleted[nodeID]
+
+	return ok
+}
+
+// Start starts the garbage collector.
+func (e *EphemeralGarbageCollector) Start() {
+	for {
+		select {
+		case <-e.cancelCh:
+			return
+		case pd := <-e.deleteCh:
+			e.mu.Lock()
+
+			entry, ok := e.toBeDeleted[pd.nodeID]
+			if !ok || entry.gen != pd.gen {
+				// Cancelled or rescheduled after this deletion was queued;
+				// drop it so a reconnected node is not removed.
+				e.mu.Unlock()
+
+				continue
 			}
-		}
 
-		if len(expired) > 0 {
-			hsdb.notifier.NotifyAll(types.StateUpdate{
-				Type:    types.StatePeerRemoved,
-				Removed: expired,
-			})
+			delete(e.toBeDeleted, pd.nodeID)
+			e.mu.Unlock()
+
+			go e.deleteFunc(pd.nodeID)
 		}
 	}
 }
 
-func (hsdb *HSDatabase) ExpireExpiredNodes(lastCheck time.Time) time.Time {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+// firstOr returns the first non-empty option, or def if none is provided.
+func firstOr(def string, opt []string) string {
+	if len(opt) > 0 && opt[0] != "" {
+		return opt[0]
+	}
 
-	// use the time of the start of the function to ensure we
-	// dont miss some nodes by returning it _after_ we have
-	// checked everything.
-	started := time.Now()
+	return def
+}
 
-	users, err := hsdb.listUsers()
+func (hsdb *HSDatabase) CreateNodeForTest(user *types.User, hostname ...string) *types.Node {
+	if !testing.Testing() {
+		panic("CreateNodeForTest can only be called during tests")
+	}
+
+	if user == nil {
+		panic("CreateNodeForTest requires a valid user")
+	}
+
+	nodeName := firstOr(defaultTestNodePrefix, hostname)
+
+	// Create a preauth key for the node
+	pak, err := hsdb.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	if err != nil {
-		log.Error().Err(err).Msg("Error listing users")
-
-		return time.Unix(0, 0)
+		panic(fmt.Sprintf("failed to create preauth key for test node: %v", err))
 	}
 
-	for _, user := range users {
-		nodes, err := hsdb.listNodesByUser(user.Name)
-		if err != nil {
-			log.Error().
-				Err(err).
-				Str("user", user.Name).
-				Msg("Error listing nodes in user")
+	pakID := pak.ID
+	nodeKey := key.NewNode()
+	machineKey := key.NewMachine()
+	discoKey := key.NewDisco()
 
-			return time.Unix(0, 0)
-		}
-
-		expired := make([]tailcfg.NodeID, 0)
-		for index, node := range nodes {
-			if node.IsExpired() &&
-				node.Expiry.After(lastCheck) {
-				expired = append(expired, tailcfg.NodeID(node.ID))
-
-				now := time.Now()
-				err := hsdb.nodeSetExpiry(nodes[index], now)
-				if err != nil {
-					log.Error().
-						Err(err).
-						Str("node", node.Hostname).
-						Str("name", node.GivenName).
-						Msg("🤮 Cannot expire node")
-				} else {
-					log.Info().
-						Str("node", node.Hostname).
-						Str("name", node.GivenName).
-						Msg("Node successfully expired")
-				}
-			}
-		}
-
-		if len(expired) > 0 {
-			hsdb.notifier.NotifyAll(types.StateUpdate{
-				Type:    types.StatePeerRemoved,
-				Removed: expired,
-			})
-		}
+	node := &types.Node{
+		MachineKey:     machineKey.Public(),
+		NodeKey:        nodeKey.Public(),
+		DiscoKey:       discoKey.Public(),
+		Hostname:       nodeName,
+		UserID:         &user.ID,
+		RegisterMethod: util.RegisterMethodAuthKey,
+		AuthKeyID:      &pakID,
 	}
 
-	return started
+	err = hsdb.DB.Save(node).Error
+	if err != nil {
+		panic(fmt.Sprintf("failed to create test node: %v", err))
+	}
+
+	return node
+}
+
+func (hsdb *HSDatabase) CreateRegisteredNodeForTest(user *types.User, hostname ...string) *types.Node {
+	if !testing.Testing() {
+		panic("CreateRegisteredNodeForTest can only be called during tests")
+	}
+
+	node := hsdb.CreateNodeForTest(user, hostname...)
+
+	// Allocate IPs for the test node using the database's IP allocator
+	// This is a simplified allocation for testing - in production this would use State.ipAlloc
+	ipv4, ipv6, err := hsdb.allocateTestIPs(node.ID)
+	if err != nil {
+		panic(fmt.Sprintf("failed to allocate IPs for test node: %v", err))
+	}
+
+	var registeredNode *types.Node
+
+	err = hsdb.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+
+		registeredNode, err = RegisterNodeForTest(tx, *node, ipv4, ipv6)
+
+		return err
+	})
+	if err != nil {
+		panic(fmt.Sprintf("failed to register test node: %v", err))
+	}
+
+	return registeredNode
+}
+
+func (hsdb *HSDatabase) CreateNodesForTest(user *types.User, count int, hostnamePrefix ...string) []*types.Node {
+	if !testing.Testing() {
+		panic("CreateNodesForTest can only be called during tests")
+	}
+
+	if user == nil {
+		panic("CreateNodesForTest requires a valid user")
+	}
+
+	prefix := firstOr(defaultTestNodePrefix, hostnamePrefix)
+
+	nodes := make([]*types.Node, count)
+	for i := range count {
+		hostname := prefix + "-" + strconv.Itoa(i)
+		nodes[i] = hsdb.CreateNodeForTest(user, hostname)
+	}
+
+	return nodes
+}
+
+func (hsdb *HSDatabase) CreateRegisteredNodesForTest(user *types.User, count int, hostnamePrefix ...string) []*types.Node {
+	if !testing.Testing() {
+		panic("CreateRegisteredNodesForTest can only be called during tests")
+	}
+
+	if user == nil {
+		panic("CreateRegisteredNodesForTest requires a valid user")
+	}
+
+	prefix := firstOr(defaultTestNodePrefix, hostnamePrefix)
+
+	nodes := make([]*types.Node, count)
+	for i := range count {
+		hostname := prefix + "-" + strconv.Itoa(i)
+		nodes[i] = hsdb.CreateRegisteredNodeForTest(user, hostname)
+	}
+
+	return nodes
+}
+
+// allocateTestIPs allocates sequential test IPs for nodes during testing.
+func (hsdb *HSDatabase) allocateTestIPs(nodeID types.NodeID) (*netip.Addr, *netip.Addr, error) {
+	if !testing.Testing() {
+		panic("allocateTestIPs can only be called during tests")
+	}
+
+	// Use simple sequential allocation for tests
+	// IPv4: 100.64.x.y (where x = nodeID/256, y = nodeID%256)
+	// IPv6: fd7a:115c:a1e0::x:y (where x = high byte, y = low byte)
+	// This supports up to 65535 nodes
+	const (
+		maxTestNodes    = 65535
+		ipv4ByteDivisor = 256
+	)
+
+	if nodeID > maxTestNodes {
+		return nil, nil, ErrCouldNotAllocateIP
+	}
+
+	// Split nodeID into high and low bytes for IPv4 (100.64.high.low)
+	highByte := byte(nodeID / ipv4ByteDivisor)
+	lowByte := byte(nodeID % ipv4ByteDivisor)
+	ipv4 := netip.AddrFrom4([4]byte{100, 64, highByte, lowByte})
+
+	// For IPv6, use the last two bytes of the address (fd7a:115c:a1e0::high:low)
+	ipv6 := netip.AddrFrom16([16]byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, highByte, lowByte})
+
+	return &ipv4, &ipv6, nil
 }

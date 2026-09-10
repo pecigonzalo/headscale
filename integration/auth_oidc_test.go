@@ -1,391 +1,1937 @@
 package integration
 
 import (
-	"context"
-	"crypto/tls"
-	"errors"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
+	"maps"
 	"net/netip"
+	"net/url"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/juanfont/headscale/integration/dockertestutil"
 	"github.com/juanfont/headscale/integration/hsic"
-	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
+	"github.com/juanfont/headscale/integration/integrationutil"
+	"github.com/juanfont/headscale/integration/tsic"
+	"github.com/oauth2-proxy/mockoidc"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 )
-
-const (
-	dockerContextPath      = "../."
-	hsicOIDCMockHashLength = 6
-	defaultAccessTTL       = 10 * time.Minute
-)
-
-var errStatusCodeNotOK = errors.New("status code not OK")
-
-type AuthOIDCScenario struct {
-	*Scenario
-
-	mockOIDC *dockertest.Resource
-}
 
 func TestOIDCAuthenticationPingAll(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
-	baseScenario, err := NewScenario()
-	assertNoErr(t, err)
-
-	scenario := AuthOIDCScenario{
-		Scenario: baseScenario,
+	// Logins to [mockoidc.MockOIDC] is served by a queue with a strict order,
+	// if we use more than one node per user, the order of the logins
+	// will not be deterministic and the test will fail.
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{"user1", "user2"},
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true),
+			oidcMockUser("user2", false),
+		},
 	}
-	defer scenario.Shutdown()
 
-	spec := map[string]int{
-		"user1": len(MustTestVersions),
-	}
+	scenario, err := NewScenario(spec)
+	require.NoError(t, err)
 
-	oidcConfig, err := scenario.runMockOIDC(defaultAccessTTL)
-	assertNoErrf(t, "failed to run mock OIDC server: %s", err)
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	oidcMap := map[string]string{
-		"HEADSCALE_OIDC_ISSUER":             oidcConfig.Issuer,
-		"HEADSCALE_OIDC_CLIENT_ID":          oidcConfig.ClientID,
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
 		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
 		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
-		"HEADSCALE_OIDC_STRIP_EMAIL_DOMAIN": fmt.Sprintf("%t", oidcConfig.StripEmaildomain),
 	}
 
-	err = scenario.CreateHeadscaleEnv(
-		spec,
+	// OIDC tests configure the mock OIDC provider via environment
+	// variables and inject the client secret as a file. This
+	// pattern is shared by all OIDC integration tests.
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
 		hsic.WithTestName("oidcauthping"),
 		hsic.WithConfigEnv(oidcMap),
-		hsic.WithHostnameAsServerURL(),
-		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(oidcConfig.ClientSecret)),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
 	)
-	assertNoErrHeadscaleEnv(t, err)
+	requireNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
-	assertNoErrListClients(t, err)
+	requireNoErrListClients(t, err)
 
 	allIps, err := scenario.ListTailscaleClientsIPs()
-	assertNoErrListClientIPs(t, err)
+	requireNoErrListClientIPs(t, err)
 
 	err = scenario.WaitForTailscaleSync()
-	assertNoErrSync(t, err)
+	requireNoErrSync(t, err)
+
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
 	})
 
-	success := pingAllHelper(t, allClients, allAddrs)
-	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
+	assertPingAll(t, allClients, allAddrs)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	listUsers, err := headscale.ListUsers()
+	require.NoError(t, err)
+
+	want := []*clientv1.User{
+		{
+			Id:    "1",
+			Name:  "user1",
+			Email: "user1@test.no",
+		},
+		{
+			Id:         "2",
+			Name:       "user1",
+			Email:      "user1@headscale.net",
+			Provider:   "oidc",
+			ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+		},
+		{
+			Id:    "3",
+			Name:  "user2",
+			Email: "user2@test.no",
+		},
+		{
+			Id:         "4",
+			Name:       "user2",
+			Email:      "", // Unverified
+			Provider:   "oidc",
+			ProviderId: scenario.mockOIDC.Issuer() + "/user2",
+		},
+	}
+
+	sort.Slice(listUsers, func(i, j int) bool {
+		return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+	})
+
+	if diff := cmp.Diff(want, listUsers, cmpopts.IgnoreUnexported(clientv1.User{}), cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt")); diff != "" {
+		t.Fatalf("unexpected users: %s", diff)
+	}
 }
 
-// This test is really flaky.
+// TestOIDCExpireNodesBasedOnTokenExpiry validates that nodes correctly transition to NeedsLogin
+// state when their OIDC tokens expire. This test uses a short token TTL to validate the
+// expiration behavior without waiting for production-length timeouts.
+//
+// The test verifies:
+// - Nodes can successfully authenticate via OIDC and establish connectivity
+// - When OIDC tokens expire, nodes transition to NeedsLogin state
+// - The expiration is based on individual token issue times, not a global timer
+//
+// Known timing considerations:
+// - Nodes may expire at different times due to sequential login processing
+// - The test must account for login time spread between first and last node.
 func TestOIDCExpireNodesBasedOnTokenExpiry(t *testing.T) {
 	IntegrationSkip(t)
-	t.Parallel()
 
 	shortAccessTTL := 5 * time.Minute
 
-	baseScenario, err := NewScenario()
-	assertNoErr(t, err)
-
-	baseScenario.pool.MaxWait = 5 * time.Minute
-
-	scenario := AuthOIDCScenario{
-		Scenario: baseScenario,
-	}
-	defer scenario.Shutdown()
-
-	spec := map[string]int{
-		"user1": 3,
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{"user1", "user2"},
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true),
+			oidcMockUser("user2", false),
+		},
+		OIDCAccessTTL: shortAccessTTL,
 	}
 
-	oidcConfig, err := scenario.runMockOIDC(shortAccessTTL)
-	assertNoErrf(t, "failed to run mock OIDC server: %s", err)
+	scenario, err := NewScenario(spec)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	oidcMap := map[string]string{
-		"HEADSCALE_OIDC_ISSUER":                oidcConfig.Issuer,
-		"HEADSCALE_OIDC_CLIENT_ID":             oidcConfig.ClientID,
-		"HEADSCALE_OIDC_CLIENT_SECRET":         oidcConfig.ClientSecret,
-		"HEADSCALE_OIDC_STRIP_EMAIL_DOMAIN":    fmt.Sprintf("%t", oidcConfig.StripEmaildomain),
+		"HEADSCALE_OIDC_ISSUER":                scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":             scenario.mockOIDC.ClientID(),
+		"HEADSCALE_OIDC_CLIENT_SECRET":         scenario.mockOIDC.ClientSecret(),
 		"HEADSCALE_OIDC_USE_EXPIRY_FROM_TOKEN": "1",
 	}
 
-	err = scenario.CreateHeadscaleEnv(
-		spec,
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
 		hsic.WithTestName("oidcexpirenodes"),
 		hsic.WithConfigEnv(oidcMap),
-		hsic.WithHostnameAsServerURL(),
 	)
-	assertNoErrHeadscaleEnv(t, err)
+	requireNoErrHeadscaleEnv(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
-	assertNoErrListClients(t, err)
+	requireNoErrListClients(t, err)
 
 	allIps, err := scenario.ListTailscaleClientsIPs()
-	assertNoErrListClientIPs(t, err)
+	requireNoErrListClientIPs(t, err)
 
+	// Record when sync completes to better estimate token expiry timing
+	syncCompleteTime := time.Now()
 	err = scenario.WaitForTailscaleSync()
-	assertNoErrSync(t, err)
+	requireNoErrSync(t, err)
+
+	loginDuration := time.Since(syncCompleteTime)
+	t.Logf("Login and sync completed in %v", loginDuration)
+
+	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
 	})
 
-	success := pingAllHelper(t, allClients, allAddrs)
-	t.Logf("%d successful pings out of %d (before expiry)", success, len(allClients)*len(allIps))
+	assertPingAll(t, allClients, allAddrs)
 
-	// This is not great, but this sadly is a time dependent test, so the
-	// safe thing to do is wait out the whole TTL time before checking if
-	// the clients have logged out. The Wait function cant do it itself
-	// as it has an upper bound of 1 min.
-	time.Sleep(shortAccessTTL)
+	// Wait for OIDC token expiry and verify all nodes transition to NeedsLogin.
+	// We add extra time to account for:
+	// - Sequential login processing causing different token issue times
+	// - Network and processing delays
+	// - Safety margin for test reliability
+	loginTimeSpread := 1 * time.Minute // Account for sequential login delays
+	safetyBuffer := 30 * time.Second   // Additional safety margin
+	totalWaitTime := integrationutil.ScaledTimeout(shortAccessTTL + loginTimeSpread + safetyBuffer)
 
-	assertTailscaleNodesLogout(t, allClients)
-}
+	t.Logf("Waiting %v for OIDC tokens to expire (TTL: %v, spread: %v, buffer: %v)",
+		totalWaitTime, shortAccessTTL, loginTimeSpread, safetyBuffer)
 
-func (s *AuthOIDCScenario) CreateHeadscaleEnv(
-	users map[string]int,
-	opts ...hsic.Option,
-) error {
-	headscale, err := s.Headscale(opts...)
-	if err != nil {
-		return err
-	}
+	// [assert.EventuallyWithT] retries the test function until it passes or times out.
+	// IMPORTANT: Use 'ct' ([assert.CollectT]) for all assertions inside the function, not 't'.
+	// Using 't' would cause immediate test failure without retries, defeating the purpose
+	// of [assert.EventuallyWithT] which is designed to handle timing-dependent conditions.
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		// Check each client's status individually to provide better diagnostics
+		expiredCount := 0
 
-	err = headscale.WaitForRunning()
-	if err != nil {
-		return err
-	}
-
-	for userName, clientCount := range users {
-		log.Printf("creating user %s with %d clients", userName, clientCount)
-		err = s.CreateUser(userName)
-		if err != nil {
-			return err
-		}
-
-		err = s.CreateTailscaleNodesInUser(userName, "all", clientCount)
-		if err != nil {
-			return err
-		}
-
-		err = s.runTailscaleUp(userName, headscale.GetEndpoint())
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (s *AuthOIDCScenario) runMockOIDC(accessTTL time.Duration) (*types.OIDCConfig, error) {
-	port, err := dockertestutil.RandomFreeHostPort()
-	if err != nil {
-		log.Fatalf("could not find an open port: %s", err)
-	}
-	portNotation := fmt.Sprintf("%d/tcp", port)
-
-	hash, _ := util.GenerateRandomStringDNSSafe(hsicOIDCMockHashLength)
-
-	hostname := fmt.Sprintf("hs-oidcmock-%s", hash)
-
-	mockOidcOptions := &dockertest.RunOptions{
-		Name:         hostname,
-		Cmd:          []string{"headscale", "mockoidc"},
-		ExposedPorts: []string{portNotation},
-		PortBindings: map[docker.Port][]docker.PortBinding{
-			docker.Port(portNotation): {{HostPort: strconv.Itoa(port)}},
-		},
-		Networks: []*dockertest.Network{s.Scenario.network},
-		Env: []string{
-			fmt.Sprintf("MOCKOIDC_ADDR=%s", hostname),
-			fmt.Sprintf("MOCKOIDC_PORT=%d", port),
-			"MOCKOIDC_CLIENT_ID=superclient",
-			"MOCKOIDC_CLIENT_SECRET=supersecret",
-			fmt.Sprintf("MOCKOIDC_ACCESS_TTL=%s", accessTTL.String()),
-		},
-	}
-
-	headscaleBuildOptions := &dockertest.BuildOptions{
-		Dockerfile: "Dockerfile.debug",
-		ContextDir: dockerContextPath,
-	}
-
-	err = s.pool.RemoveContainerByName(hostname)
-	if err != nil {
-		return nil, err
-	}
-
-	if pmockoidc, err := s.pool.BuildAndRunWithBuildOptions(
-		headscaleBuildOptions,
-		mockOidcOptions,
-		dockertestutil.DockerRestartPolicy); err == nil {
-		s.mockOIDC = pmockoidc
-	} else {
-		return nil, err
-	}
-
-	log.Println("Waiting for headscale mock oidc to be ready for tests")
-	hostEndpoint := fmt.Sprintf("%s:%d", s.mockOIDC.GetIPInNetwork(s.network), port)
-
-	if err := s.pool.Retry(func() error {
-		oidcConfigURL := fmt.Sprintf("http://%s/oidc/.well-known/openid-configuration", hostEndpoint)
-		httpClient := &http.Client{}
-		ctx := context.Background()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, oidcConfigURL, nil)
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			log.Printf("headscale mock OIDC tests is not ready: %s\n", err)
-
-			return err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return errStatusCodeNotOK
-		}
-
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-
-	log.Printf("headscale mock oidc is ready for tests at %s", hostEndpoint)
-
-	return &types.OIDCConfig{
-		Issuer: fmt.Sprintf(
-			"http://%s/oidc",
-			net.JoinHostPort(s.mockOIDC.GetIPInNetwork(s.network), strconv.Itoa(port)),
-		),
-		ClientID:                   "superclient",
-		ClientSecret:               "supersecret",
-		StripEmaildomain:           true,
-		OnlyStartIfOIDCIsAvailable: true,
-	}, nil
-}
-
-func (s *AuthOIDCScenario) runTailscaleUp(
-	userStr, loginServer string,
-) error {
-	headscale, err := s.Headscale()
-	if err != nil {
-		return err
-	}
-
-	log.Printf("running tailscale up for user %s", userStr)
-	if user, ok := s.users[userStr]; ok {
-		for _, client := range user.Clients {
-			c := client
-			user.joinWaitGroup.Go(func() error {
-				loginURL, err := c.LoginWithURL(loginServer)
-				if err != nil {
-					log.Printf("%s failed to run tailscale up: %s", c.Hostname(), err)
+		for _, client := range allClients {
+			status, err := client.Status()
+			if assert.NoError(ct, err, "failed to get status for client %s", client.Hostname()) {
+				if status.BackendState == "NeedsLogin" {
+					expiredCount++
 				}
-
-				loginURL.Host = fmt.Sprintf("%s:8080", headscale.GetIP())
-				loginURL.Scheme = "http"
-
-				insecureTransport := &http.Transport{
-					TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // nolint
-				}
-
-				log.Printf("%s login url: %s\n", c.Hostname(), loginURL.String())
-
-				if err := s.pool.Retry(func() error {
-					log.Printf("%s logging in with url", c.Hostname())
-					httpClient := &http.Client{Transport: insecureTransport}
-					ctx := context.Background()
-					req, _ := http.NewRequestWithContext(ctx, http.MethodGet, loginURL.String(), nil)
-					resp, err := httpClient.Do(req)
-					if err != nil {
-						log.Printf(
-							"%s failed to login using url %s: %s",
-							c.Hostname(),
-							loginURL,
-							err,
-						)
-
-						return err
-					}
-
-					if resp.StatusCode != http.StatusOK {
-						log.Printf("%s response code of oidc login request was %s", c.Hostname(), resp.Status)
-
-						return errStatusCodeNotOK
-					}
-
-					defer resp.Body.Close()
-
-					_, err = io.ReadAll(resp.Body)
-					if err != nil {
-						log.Printf("%s failed to read response body: %s", c.Hostname(), err)
-
-						return err
-					}
-
-					return nil
-				}); err != nil {
-					return err
-				}
-
-				log.Printf("Finished request for %s to join tailnet", c.Hostname())
-
-				return nil
-			})
-
-			log.Printf("client %s is ready", client.Hostname())
-		}
-
-		if err := user.joinWaitGroup.Wait(); err != nil {
-			return err
-		}
-
-		for _, client := range user.Clients {
-			err := client.WaitForRunning()
-			if err != nil {
-				return fmt.Errorf(
-					"%s tailscale node has not reached running: %w",
-					client.Hostname(),
-					err,
-				)
 			}
 		}
 
-		return nil
-	}
+		// Log progress for debugging
+		if expiredCount < len(allClients) {
+			t.Logf("Token expiry progress: %d/%d clients in NeedsLogin state", expiredCount, len(allClients))
+		}
 
-	return fmt.Errorf("failed to up tailscale node: %w", errNoUserAvailable)
+		// All clients must be in NeedsLogin state
+		assert.Equal(ct, len(allClients), expiredCount,
+			"expected all %d clients to be in NeedsLogin state, but only %d are",
+			len(allClients), expiredCount)
+
+		// Only check detailed logout state if all clients are expired
+		if expiredCount == len(allClients) {
+			assertTailscaleNodesLogout(ct, allClients)
+		}
+	}, totalWaitTime, 5*time.Second)
 }
 
-func (s *AuthOIDCScenario) Shutdown() {
-	err := s.pool.Purge(s.mockOIDC)
-	if err != nil {
-		log.Printf("failed to remove mock oidc container")
+func TestOIDC024UserCreation(t *testing.T) {
+	IntegrationSkip(t)
+
+	tests := []struct {
+		name          string
+		config        map[string]string
+		emailVerified bool
+		cliUsers      []string
+		oidcUsers     []string
+		want          func(iss string) []*clientv1.User
+	}{
+		{
+			name:          "no-migration-verified-email",
+			emailVerified: true,
+			cliUsers:      []string{"user1", "user2"},
+			oidcUsers:     []string{"user1", "user2"},
+			want: func(iss string) []*clientv1.User {
+				return []*clientv1.User{
+					{
+						Id:    "1",
+						Name:  "user1",
+						Email: "user1@test.no",
+					},
+					{
+						Id:         "2",
+						Name:       "user1",
+						Email:      "user1@headscale.net",
+						Provider:   "oidc",
+						ProviderId: iss + "/user1",
+					},
+					{
+						Id:    "3",
+						Name:  "user2",
+						Email: "user2@test.no",
+					},
+					{
+						Id:         "4",
+						Name:       "user2",
+						Email:      "user2@headscale.net",
+						Provider:   "oidc",
+						ProviderId: iss + "/user2",
+					},
+				}
+			},
+		},
+		{
+			name:          "no-migration-not-verified-email",
+			emailVerified: false,
+			cliUsers:      []string{"user1", "user2"},
+			oidcUsers:     []string{"user1", "user2"},
+			want: func(iss string) []*clientv1.User {
+				return []*clientv1.User{
+					{
+						Id:    "1",
+						Name:  "user1",
+						Email: "user1@test.no",
+					},
+					{
+						Id:         "2",
+						Name:       "user1",
+						Provider:   "oidc",
+						ProviderId: iss + "/user1",
+					},
+					{
+						Id:    "3",
+						Name:  "user2",
+						Email: "user2@test.no",
+					},
+					{
+						Id:         "4",
+						Name:       "user2",
+						Provider:   "oidc",
+						ProviderId: iss + "/user2",
+					},
+				}
+			},
+		},
+		{
+			name:          "migration-no-strip-domains-not-verified-email",
+			emailVerified: false,
+			cliUsers:      []string{"user1.headscale.net", "user2.headscale.net"},
+			oidcUsers:     []string{"user1", "user2"},
+			want: func(iss string) []*clientv1.User {
+				return []*clientv1.User{
+					{
+						Id:    "1",
+						Name:  "user1.headscale.net",
+						Email: "user1.headscale.net@test.no",
+					},
+					{
+						Id:         "2",
+						Name:       "user1",
+						Provider:   "oidc",
+						ProviderId: iss + "/user1",
+					},
+					{
+						Id:    "3",
+						Name:  "user2.headscale.net",
+						Email: "user2.headscale.net@test.no",
+					},
+					{
+						Id:         "4",
+						Name:       "user2",
+						Provider:   "oidc",
+						ProviderId: iss + "/user2",
+					},
+				}
+			},
+		},
 	}
 
-	s.Scenario.Shutdown()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := ScenarioSpec{
+				NodesPerUser: 1,
+			}
+			spec.Users = append(spec.Users, tt.cliUsers...)
+
+			for _, user := range tt.oidcUsers {
+				spec.OIDCUsers = append(spec.OIDCUsers, oidcMockUser(user, tt.emailVerified))
+			}
+
+			scenario, err := NewScenario(spec)
+
+			require.NoError(t, err)
+			defer scenario.ShutdownAssertNoPanics(t)
+
+			oidcMap := map[string]string{
+				"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+				"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+				"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+				"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+			}
+			maps.Copy(oidcMap, tt.config)
+
+			err = scenario.CreateHeadscaleEnvWithLoginURL(
+				nil,
+				hsic.WithTestName("oidcmigration"),
+				hsic.WithConfigEnv(oidcMap),
+				hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+			)
+			requireNoErrHeadscaleEnv(t, err)
+
+			// Ensure that the nodes have logged in, this is what
+			// triggers user creation via OIDC.
+			err = scenario.WaitForTailscaleSync()
+			requireNoErrSync(t, err)
+
+			headscale, err := scenario.Headscale()
+			require.NoError(t, err)
+
+			want := tt.want(scenario.mockOIDC.Issuer())
+
+			listUsers, err := headscale.ListUsers()
+			require.NoError(t, err)
+
+			sort.Slice(listUsers, func(i, j int) bool {
+				return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+			})
+
+			if diff := cmp.Diff(want, listUsers, cmpopts.IgnoreUnexported(clientv1.User{}), cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt")); diff != "" {
+				t.Errorf("unexpected users: %s", diff)
+			}
+		})
+	}
 }
 
-func assertTailscaleNodesLogout(t *testing.T, clients []TailscaleClient) {
-	t.Helper()
+func TestOIDCAuthenticationWithPKCE(t *testing.T) {
+	IntegrationSkip(t)
 
-	for _, client := range clients {
-		status, err := client.Status()
-		assertNoErr(t, err)
-
-		assert.Equal(t, "NeedsLogin", status.BackendState)
+	// Single user with one node for testing PKCE flow
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{"user1"},
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true),
+		},
 	}
+
+	scenario, err := NewScenario(spec)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_PKCE_ENABLED":       "1", // Enable PKCE
+	}
+
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
+		hsic.WithTestName("oidcauthpkce"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	// Get all clients and verify they can connect
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	allIps, err := scenario.ListTailscaleClientsIPs()
+	requireNoErrListClientIPs(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
+		return x.String()
+	})
+
+	assertPingAll(t, allClients, allAddrs)
+}
+
+// TestOIDCReloginSameNodeNewUser tests the scenario where:
+// 1. A Tailscale client logs in with user1 (creates node1 for user1)
+// 2. The same client logs out and logs in with user2 (creates node2 for user2)
+// 3. The same client logs out and logs in with user1 again (reuses node1, node2 remains)
+// This validates that OIDC relogin properly handles node reuse and cleanup.
+func TestOIDCReloginSameNodeNewUser(t *testing.T) {
+	IntegrationSkip(t)
+
+	// Create no nodes and no users
+	scenario, err := NewScenario(ScenarioSpec{
+		// First login creates the first OIDC user
+		// Second login logs in the same node, which creates a new node
+		// Third login logs in the same node back into the original user
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true),
+			oidcMockUser("user2", true),
+			oidcMockUser("user1", true),
+		},
+	})
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+	}
+
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
+		hsic.WithTestName("oidc-authrelog"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	ts, err := scenario.CreateTailscaleNode("unstable", tsic.WithNetwork(scenario.networks[scenario.testDefaultNetwork]))
+	require.NoError(t, err)
+
+	u, err := ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	t.Logf("Validating initial user creation at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listUsers, err := headscale.ListUsers()
+		assert.NoError(ct, err, "Failed to list users during initial validation")
+		assert.Len(ct, listUsers, 1, "Expected exactly 1 user after first login, got %d", len(listUsers))
+
+		wantUsers := []*clientv1.User{
+			{
+				Id:         "1",
+				Name:       "user1",
+				Email:      "user1@headscale.net",
+				Provider:   "oidc",
+				ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+			},
+		}
+
+		sort.Slice(listUsers, func(i, j int) bool {
+			return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+		})
+
+		if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(clientv1.User{}), cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt")); diff != "" {
+			ct.Errorf("User validation failed after first login - unexpected users: %s", diff)
+		}
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating user1 creation after initial OIDC login")
+
+	t.Logf("Validating initial node creation at %s", time.Now().Format(TimestampFormat))
+
+	var listNodes []*clientv1.Node
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+
+		listNodes, err = headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes during initial validation")
+		assert.Len(ct, listNodes, 1, "Expected exactly 1 node after first login, got %d", len(listNodes))
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating initial node creation for user1 after OIDC login")
+
+	// Collect expected node IDs for validation after user1 initial login
+	expectedNodes := make([]types.NodeID, 0, 1)
+
+	var nodeID uint64
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status := ts.MustStatus()
+		assert.NotEmpty(ct, status.Self.ID, "Node ID should be populated in status")
+
+		var err error
+
+		nodeID, err = strconv.ParseUint(string(status.Self.ID), 10, 64)
+		assert.NoError(ct, err, "Failed to parse node ID from status")
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for node ID to be populated in status after initial login")
+
+	expectedNodes = append(expectedNodes, types.NodeID(nodeID))
+
+	// Validate initial connection state for user1
+	validateInitialConnection(t, headscale, expectedNodes)
+
+	// Log out user1 and log in user2, this should create a new node
+	// for user2, the node should have the same machine key and
+	// a new node key.
+	err = ts.Logout()
+	require.NoError(t, err)
+
+	// TODO(kradalby): Not sure why we need to logout twice, but it fails and
+	// logs in immediately after the first logout and I cannot reproduce it
+	// manually.
+	err = ts.Logout()
+	require.NoError(t, err)
+
+	// Wait for logout to complete and then do second logout
+	t.Logf("Waiting for user1 logout completion at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		// Check that the first logout completed
+		status, err := ts.Status()
+		assert.NoError(ct, err, "Failed to get client status during logout validation")
+		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after logout, got %s", status.BackendState)
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 logout to complete before user2 login")
+
+	u, err = ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	t.Logf("Validating user2 creation at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listUsers, err := headscale.ListUsers()
+		assert.NoError(ct, err, "Failed to list users after user2 login")
+		assert.Len(ct, listUsers, 2, "Expected exactly 2 users after user2 login, got %d users", len(listUsers))
+
+		wantUsers := []*clientv1.User{
+			{
+				Id:         "1",
+				Name:       "user1",
+				Email:      "user1@headscale.net",
+				Provider:   "oidc",
+				ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+			},
+			{
+				Id:         "2",
+				Name:       "user2",
+				Email:      "user2@headscale.net",
+				Provider:   "oidc",
+				ProviderId: scenario.mockOIDC.Issuer() + "/user2",
+			},
+		}
+
+		sort.Slice(listUsers, func(i, j int) bool {
+			return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+		})
+
+		if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(clientv1.User{}), cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt")); diff != "" {
+			ct.Errorf("User validation failed after user2 login - expected both user1 and user2: %s", diff)
+		}
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating both user1 and user2 exist after second OIDC login")
+
+	var listNodesAfterNewUserLogin []*clientv1.Node
+	// First, wait for the new node to be created
+	t.Logf("Waiting for user2 node creation at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listNodesAfterNewUserLogin, err = headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes after user2 login")
+		// We might temporarily have more than 2 nodes during cleanup, so check for at least 2
+		assert.GreaterOrEqual(ct, len(listNodesAfterNewUserLogin), 2, "Should have at least 2 nodes after user2 login, got %d (may include temporary nodes during cleanup)", len(listNodesAfterNewUserLogin))
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user2 node creation (allowing temporary extra nodes during cleanup)")
+
+	// Then wait for cleanup to stabilize at exactly 2 nodes
+	t.Logf("Waiting for node cleanup stabilization at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listNodesAfterNewUserLogin, err = headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes during cleanup validation")
+		assert.Len(ct, listNodesAfterNewUserLogin, 2, "Should have exactly 2 nodes after cleanup (1 for user1, 1 for user2), got %d nodes", len(listNodesAfterNewUserLogin))
+
+		// Validate that both nodes have the same machine key but different node keys
+		if len(listNodesAfterNewUserLogin) >= 2 {
+			// Machine key is the same as the "machine" has not changed,
+			// but Node key is not as it is a new node
+			assert.Equal(ct, listNodes[0].MachineKey, listNodesAfterNewUserLogin[0].MachineKey, "Machine key should be preserved from original node")
+			assert.Equal(ct, listNodesAfterNewUserLogin[0].MachineKey, listNodesAfterNewUserLogin[1].MachineKey, "Both nodes should share the same machine key")
+			assert.NotEqual(ct, listNodesAfterNewUserLogin[0].NodeKey, listNodesAfterNewUserLogin[1].NodeKey, "Node keys should be different between user1 and user2 nodes")
+		}
+	}, integrationutil.PolicyPropagationTimeout, 2*time.Second, "waiting for node count stabilization at exactly 2 nodes after user2 login")
+
+	// Security validation: Only user2's node should be active after user switch
+	var activeUser2NodeID types.NodeID
+
+	for _, node := range listNodesAfterNewUserLogin {
+		if node.User.Id == "2" { // user2
+			activeUser2NodeID = types.NodeID(mustParseID(node.Id))
+			t.Logf("Active user2 node: %d (User: %s)", mustParseID(node.Id), node.User.Name)
+
+			break
+		}
+	}
+
+	// Validate only user2's node is online (security requirement)
+	t.Logf("Validating only user2 node is online at %s", time.Now().Format(TimestampFormat))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodeStore, err := headscale.DebugNodeStore()
+		assert.NoError(c, err, "Failed to get nodestore debug info")
+
+		// Check user2 node is online
+		if node, exists := nodeStore[activeUser2NodeID]; exists {
+			assert.NotNil(c, node.IsOnline, "User2 node should have online status")
+
+			if node.IsOnline != nil {
+				assert.True(c, *node.IsOnline, "User2 node should be online after login")
+			}
+		} else {
+			assert.Fail(c, "User2 node not found in nodestore")
+		}
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "validating only user2 node is online after user switch")
+
+	// Before logging out user2, validate we have exactly 2 nodes and both are stable
+	t.Logf("Pre-logout validation: checking node stability at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		currentNodes, err := headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes before user2 logout")
+		assert.Len(ct, currentNodes, 2, "Should have exactly 2 stable nodes before user2 logout, got %d", len(currentNodes))
+
+		// Validate node stability - ensure no phantom nodes
+		for i, node := range currentNodes {
+			assert.NotEmpty(ct, node.User.Id, "Node %d should have a valid user before logout", i)
+			assert.NotEmpty(ct, node.MachineKey, "Node %d should have a valid machine key before logout", i)
+			t.Logf("Pre-logout node %d: User=%s, MachineKey=%s", i, node.User.Name, node.MachineKey[:16]+"...")
+		}
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "validating stable node count and integrity before user2 logout")
+
+	// Log out user2, and log into user1, no new node should be created,
+	// the node should now "become" node1 again
+	err = ts.Logout()
+	require.NoError(t, err)
+
+	t.Logf("Logged out take one")
+	t.Log("timestamp: " + time.Now().Format(TimestampFormat) + "\n")
+
+	// TODO(kradalby): Not sure why we need to logout twice, but it fails and
+	// logs in immediately after the first logout and I cannot reproduce it
+	// manually.
+	err = ts.Logout()
+	require.NoError(t, err)
+
+	t.Logf("Logged out take two")
+	t.Log("timestamp: " + time.Now().Format(TimestampFormat) + "\n")
+
+	// Wait for logout to complete and then do second logout
+	t.Logf("Waiting for user2 logout completion at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		// Check that the first logout completed
+		status, err := ts.Status()
+		assert.NoError(ct, err, "Failed to get client status during user2 logout validation")
+		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after user2 logout, got %s", status.BackendState)
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user2 logout to complete before user1 relogin")
+
+	// Before logging back in, ensure we still have exactly 2 nodes
+	// Note: We skip [validateLogoutComplete] here since it expects all nodes to be offline,
+	// but in OIDC scenario we maintain both nodes in DB with only active user online
+
+	// Additional validation that nodes are properly maintained during logout
+	t.Logf("Post-logout validation: checking node persistence at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		currentNodes, err := headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes after user2 logout")
+		assert.Len(ct, currentNodes, 2, "Should still have exactly 2 nodes after user2 logout (nodes should persist), got %d", len(currentNodes))
+
+		// Ensure both nodes are still valid (not cleaned up incorrectly)
+		for i, node := range currentNodes {
+			assert.NotEmpty(ct, node.User.Id, "Node %d should still have a valid user after user2 logout", i)
+			assert.NotEmpty(ct, node.MachineKey, "Node %d should still have a valid machine key after user2 logout", i)
+			t.Logf("Post-logout node %d: User=%s, MachineKey=%s", i, node.User.Name, node.MachineKey[:16]+"...")
+		}
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "validating node persistence and integrity after user2 logout")
+
+	// We do not actually "change" the user here, it is done by logging in again
+	// as the OIDC mock server is kind of like a stack, and the next user is
+	// prepared and ready to go.
+	u, err = ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	t.Logf("Waiting for user1 relogin completion at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := ts.Status()
+		assert.NoError(ct, err, "Failed to get client status during user1 relogin validation")
+		assert.Equal(ct, "Running", status.BackendState, "Expected Running state after user1 relogin, got %s", status.BackendState)
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 relogin to complete (final login)")
+
+	t.Logf("Logged back in")
+	t.Log("timestamp: " + time.Now().Format(TimestampFormat) + "\n")
+
+	t.Logf("Final validation: checking user persistence at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listUsers, err := headscale.ListUsers()
+		assert.NoError(ct, err, "Failed to list users during final validation")
+		assert.Len(ct, listUsers, 2, "Should still have exactly 2 users after user1 relogin, got %d", len(listUsers))
+
+		wantUsers := []*clientv1.User{
+			{
+				Id:         "1",
+				Name:       "user1",
+				Email:      "user1@headscale.net",
+				Provider:   "oidc",
+				ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+			},
+			{
+				Id:         "2",
+				Name:       "user2",
+				Email:      "user2@headscale.net",
+				Provider:   "oidc",
+				ProviderId: scenario.mockOIDC.Issuer() + "/user2",
+			},
+		}
+
+		sort.Slice(listUsers, func(i, j int) bool {
+			return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+		})
+
+		if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(clientv1.User{}), cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt")); diff != "" {
+			ct.Errorf("Final user validation failed - both users should persist after relogin cycle: %s", diff)
+		}
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating user persistence after complete relogin cycle (user1->user2->user1)")
+
+	var listNodesAfterLoggingBackIn []*clientv1.Node
+	// Wait for login to complete and nodes to stabilize
+	t.Logf("Final node validation: checking node stability after user1 relogin at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listNodesAfterLoggingBackIn, err = headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes during final validation")
+
+		// Allow for temporary instability during login process
+		if len(listNodesAfterLoggingBackIn) < 2 {
+			ct.Errorf("Not enough nodes yet during final validation, got %d, want at least 2", len(listNodesAfterLoggingBackIn))
+			return
+		}
+
+		// Final check should have exactly 2 nodes
+		assert.Len(ct, listNodesAfterLoggingBackIn, 2, "Should have exactly 2 nodes after complete relogin cycle, got %d", len(listNodesAfterLoggingBackIn))
+
+		// Validate that the machine we had when we logged in the first time, has the same
+		// machine key, but a different ID than the newly logged in version of the same
+		// machine.
+		assert.Equal(ct, listNodes[0].MachineKey, listNodesAfterNewUserLogin[0].MachineKey, "Original user1 machine key should match user1 node after user switch")
+		assert.Equal(ct, listNodes[0].NodeKey, listNodesAfterNewUserLogin[0].NodeKey, "Original user1 node key should match user1 node after user switch")
+		assert.Equal(ct, listNodes[0].Id, listNodesAfterNewUserLogin[0].Id, "Original user1 node ID should match user1 node after user switch")
+		assert.Equal(ct, listNodes[0].MachineKey, listNodesAfterNewUserLogin[1].MachineKey, "User1 and user2 nodes should share the same machine key")
+		assert.NotEqual(ct, listNodes[0].Id, listNodesAfterNewUserLogin[1].Id, "User1 and user2 nodes should have different node IDs")
+		assert.NotEqual(ct, listNodes[0].User.Id, listNodesAfterNewUserLogin[1].User.Id, "User1 and user2 nodes should belong to different users")
+
+		// Even tho we are logging in again with the same user, the previous key has been expired
+		// and a new one has been generated. The node entry in the database should be the same
+		// as the user + machinekey still matches.
+		assert.Equal(ct, listNodes[0].MachineKey, listNodesAfterLoggingBackIn[0].MachineKey, "Machine key should remain consistent after user1 relogin")
+		assert.NotEqual(ct, listNodes[0].NodeKey, listNodesAfterLoggingBackIn[0].NodeKey, "Node key should be regenerated after user1 relogin")
+		assert.Equal(ct, listNodes[0].Id, listNodesAfterLoggingBackIn[0].Id, "Node ID should be preserved for user1 after relogin")
+
+		// The "logged back in" machine should have the same machinekey but a different nodekey
+		// than the version logged in with a different user.
+		assert.Equal(ct, listNodesAfterLoggingBackIn[0].MachineKey, listNodesAfterLoggingBackIn[1].MachineKey, "Both final nodes should share the same machine key")
+		assert.NotEqual(ct, listNodesAfterLoggingBackIn[0].NodeKey, listNodesAfterLoggingBackIn[1].NodeKey, "Final nodes should have different node keys for different users")
+
+		t.Logf("Final validation complete - node counts and key relationships verified at %s", time.Now().Format(TimestampFormat))
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "validating final node state after complete user1->user2->user1 relogin cycle with detailed key validation")
+
+	// Security validation: Only user1's node should be active after relogin
+	var activeUser1NodeID types.NodeID
+
+	for _, node := range listNodesAfterLoggingBackIn {
+		if node.User.Id == "1" { // user1
+			activeUser1NodeID = types.NodeID(mustParseID(node.Id))
+			t.Logf("Active user1 node after relogin: %d (User: %s)", mustParseID(node.Id), node.User.Name)
+
+			break
+		}
+	}
+
+	// Validate only user1's node is online (security requirement)
+	t.Logf("Validating only user1 node is online after relogin at %s", time.Now().Format(TimestampFormat))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodeStore, err := headscale.DebugNodeStore()
+		assert.NoError(c, err, "Failed to get nodestore debug info")
+
+		// Check user1 node is online
+		if node, exists := nodeStore[activeUser1NodeID]; exists {
+			assert.NotNil(c, node.IsOnline, "User1 node should have online status after relogin")
+
+			if node.IsOnline != nil {
+				assert.True(c, *node.IsOnline, "User1 node should be online after relogin")
+			}
+		} else {
+			assert.Fail(c, "User1 node not found in nodestore after relogin")
+		}
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "validating only user1 node is online after final relogin")
+}
+
+// TestOIDCFollowUpUrl validates the follow-up login flow
+// Prerequisites:
+// - short TTL for the registration cache via HEADSCALE_TUNING_REGISTER_CACHE_EXPIRATION
+// Scenario:
+// - client starts a login process and gets initial AuthURL
+// - time.sleep(HEADSCALE_TUNING_REGISTER_CACHE_EXPIRATION + 30 secs) waits for the cache to expire
+// - client checks its status to verify that AuthUrl has changed (by followup URL)
+// - client uses the new AuthURL to log in. It should complete successfully.
+func TestOIDCFollowUpUrl(t *testing.T) {
+	IntegrationSkip(t)
+
+	// Create no nodes and no users
+	scenario, err := NewScenario(
+		ScenarioSpec{
+			OIDCUsers: []mockoidc.MockUser{
+				oidcMockUser("user1", true),
+			},
+		},
+	)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+		// smaller cache expiration time to quickly expire AuthURL
+		"HEADSCALE_TUNING_REGISTER_CACHE_CLEANUP":    "10s",
+		"HEADSCALE_TUNING_REGISTER_CACHE_EXPIRATION": "1m30s",
+	}
+
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
+		hsic.WithTestName("oidc-followup"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+	)
+	require.NoError(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	listUsers, err := headscale.ListUsers()
+	require.NoError(t, err)
+	assert.Empty(t, listUsers)
+
+	ts, err := scenario.CreateTailscaleNode(
+		"unstable",
+		tsic.WithNetwork(scenario.networks[scenario.testDefaultNetwork]),
+	)
+	require.NoError(t, err)
+
+	u, err := ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	// wait for the registration cache to expire
+	// a little bit more than HEADSCALE_TUNING_REGISTER_CACHE_EXPIRATION (1m30s)
+	//nolint:forbidigo // Intentional delay: must wait for real-time cache expiration (HEADSCALE_TUNING_REGISTER_CACHE_EXPIRATION=1m30s)
+	time.Sleep(2 * time.Minute)
+
+	var newUrl *url.URL
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		st, err := ts.Status()
+		assert.NoError(c, err)
+		assert.Equal(c, "NeedsLogin", st.BackendState)
+
+		// get new AuthURL from daemon
+		newUrl, err = url.Parse(st.AuthURL)
+		assert.NoError(c, err)
+
+		assert.NotEqual(c, u.String(), st.AuthURL, "AuthURL should change")
+	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.FastPoll, "Waiting for registration cache to expire and status to reflect NeedsLogin")
+
+	_, err = doLoginURL(ts.Hostname(), newUrl)
+	require.NoError(t, err)
+
+	listUsers, err = headscale.ListUsers()
+	require.NoError(t, err)
+	assert.Len(t, listUsers, 1)
+
+	wantUsers := []*clientv1.User{
+		{
+			Id:         "1",
+			Name:       "user1",
+			Email:      "user1@headscale.net",
+			Provider:   "oidc",
+			ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+		},
+	}
+
+	sort.Slice(
+		listUsers, func(i, j int) bool {
+			return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+		},
+	)
+
+	if diff := cmp.Diff(
+		wantUsers,
+		listUsers,
+		cmpopts.IgnoreUnexported(clientv1.User{}),
+		cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt"),
+	); diff != "" {
+		t.Fatalf("unexpected users: %s", diff)
+	}
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		listNodes, err := headscale.ListNodes()
+		assert.NoError(c, err)
+		assert.Len(c, listNodes, 1)
+	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.FastPoll, "Waiting for expected node list after OIDC login")
+}
+
+// TestOIDCMultipleOpenedLoginUrls tests the scenario:
+// - client (mostly Windows) opens multiple browser tabs with different login URLs
+// - client performs auth on the first opened browser tab
+//
+// This test makes sure that cookies are still valid for the first browser tab.
+func TestOIDCMultipleOpenedLoginUrls(t *testing.T) {
+	IntegrationSkip(t)
+
+	scenario, err := NewScenario(
+		ScenarioSpec{
+			OIDCUsers: []mockoidc.MockUser{
+				oidcMockUser("user1", true),
+			},
+		},
+	)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+	}
+
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
+		hsic.WithTestName("oidcauthrelog"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+	)
+	require.NoError(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	listUsers, err := headscale.ListUsers()
+	require.NoError(t, err)
+	assert.Empty(t, listUsers)
+
+	ts, err := scenario.CreateTailscaleNode(
+		"unstable",
+		tsic.WithNetwork(scenario.networks[scenario.testDefaultNetwork]),
+	)
+	require.NoError(t, err)
+
+	u1, err := ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	u2, err := ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	// make sure login URLs are different
+	require.NotEqual(t, u1.String(), u2.String())
+
+	loginClient, err := newLoginHTTPClient(ts.Hostname())
+	require.NoError(t, err)
+
+	// open the first login URL "in browser"
+	_, redirect1, err := doLoginURLWithClient(ts.Hostname(), u1, loginClient, false)
+	require.NoError(t, err)
+	// open the second login URL "in browser"
+	_, redirect2, err := doLoginURLWithClient(ts.Hostname(), u2, loginClient, false)
+	require.NoError(t, err)
+
+	// two valid redirects with different state/nonce params
+	require.NotEqual(t, redirect1.String(), redirect2.String())
+
+	// complete auth with the first opened "browser tab"
+	_, _, err = doLoginURLWithClient(ts.Hostname(), redirect1, loginClient, true)
+	require.NoError(t, err)
+
+	listUsers, err = headscale.ListUsers()
+	require.NoError(t, err)
+	assert.Len(t, listUsers, 1)
+
+	wantUsers := []*clientv1.User{
+		{
+			Id:         "1",
+			Name:       "user1",
+			Email:      "user1@headscale.net",
+			Provider:   "oidc",
+			ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+		},
+	}
+
+	sort.Slice(
+		listUsers, func(i, j int) bool {
+			return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+		},
+	)
+
+	if diff := cmp.Diff(
+		wantUsers,
+		listUsers,
+		cmpopts.IgnoreUnexported(clientv1.User{}),
+		cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt"),
+	); diff != "" {
+		t.Fatalf("unexpected users: %s", diff)
+	}
+
+	assert.EventuallyWithT(
+		t, func(c *assert.CollectT) {
+			listNodes, err := headscale.ListNodes()
+			assert.NoError(c, err)
+			assert.Len(c, listNodes, 1)
+		}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.FastPoll, "Waiting for expected node list after OIDC login",
+	)
+}
+
+// TestOIDCReloginSameNodeSameUser tests the scenario where a single Tailscale client
+// authenticates using OIDC (OpenID Connect), logs out, and then logs back in as the same user.
+//
+// OIDC is an authentication layer built on top of OAuth 2.0 that allows users to authenticate
+// using external identity providers (like Google, Microsoft, etc.) rather than managing
+// credentials directly in headscale.
+//
+// This test validates the "same user relogin" behavior in headscale's OIDC authentication flow:
+// - A single client authenticates via OIDC as user1
+// - The client logs out, ending the session
+// - The same client logs back in via OIDC as the same user (user1)
+// - The test verifies that the user account persists correctly
+// - The test verifies that the machine key is preserved (since it's the same physical device)
+// - The test verifies that the node ID is preserved (since it's the same user on the same device)
+// - The test verifies that the node key is regenerated (since it's a new session)
+// - The test verifies that the client comes back online properly
+//
+// This scenario is important for normal user workflows where someone might need to restart
+// their Tailscale client, reboot their computer, or temporarily disconnect and reconnect.
+// It ensures that headscale properly handles session management while preserving device
+// identity and user associations.
+//
+// The test uses a single node scenario (unlike multi-node tests) to focus specifically on
+// the authentication and session management aspects rather than network topology changes.
+// The "same node" in the name refers to the same physical device/client, while "same user"
+// refers to authenticating with the same OIDC identity.
+func TestOIDCReloginSameNodeSameUser(t *testing.T) {
+	IntegrationSkip(t)
+
+	// Create scenario with same user for both login attempts
+	scenario, err := NewScenario(ScenarioSpec{
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true), // Initial login
+			oidcMockUser("user1", true), // Relogin with same user
+		},
+	})
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+	}
+
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
+		hsic.WithTestName("oidcsameuser"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	ts, err := scenario.CreateTailscaleNode("unstable", tsic.WithNetwork(scenario.networks[scenario.testDefaultNetwork]))
+	require.NoError(t, err)
+
+	// Initial login as user1
+	u, err := ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	t.Logf("Validating initial user1 creation at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listUsers, err := headscale.ListUsers()
+		assert.NoError(ct, err, "Failed to list users during initial validation")
+		assert.Len(ct, listUsers, 1, "Expected exactly 1 user after first login, got %d", len(listUsers))
+
+		wantUsers := []*clientv1.User{
+			{
+				Id:         "1",
+				Name:       "user1",
+				Email:      "user1@headscale.net",
+				Provider:   "oidc",
+				ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+			},
+		}
+
+		sort.Slice(listUsers, func(i, j int) bool {
+			return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+		})
+
+		if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(clientv1.User{}), cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt")); diff != "" {
+			ct.Errorf("User validation failed after first login - unexpected users: %s", diff)
+		}
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating user1 creation after initial OIDC login")
+
+	t.Logf("Validating initial node creation at %s", time.Now().Format(TimestampFormat))
+
+	var initialNodes []*clientv1.Node
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+
+		initialNodes, err = headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes during initial validation")
+		assert.Len(ct, initialNodes, 1, "Expected exactly 1 node after first login, got %d", len(initialNodes))
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating initial node creation for user1 after OIDC login")
+
+	// Collect expected node IDs for validation after user1 initial login
+	expectedNodes := make([]types.NodeID, 0, 1)
+
+	var nodeID uint64
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status := ts.MustStatus()
+		assert.NotEmpty(ct, status.Self.ID, "Node ID should be populated in status")
+
+		var err error
+
+		nodeID, err = strconv.ParseUint(string(status.Self.ID), 10, 64)
+		assert.NoError(ct, err, "Failed to parse node ID from status")
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for node ID to be populated in status after initial login")
+
+	expectedNodes = append(expectedNodes, types.NodeID(nodeID))
+
+	// Validate initial connection state for user1
+	validateInitialConnection(t, headscale, expectedNodes)
+
+	// Store initial node keys for comparison
+	initialMachineKey := initialNodes[0].MachineKey
+	initialNodeKey := initialNodes[0].NodeKey
+	initialNodeID := initialNodes[0].Id
+
+	// Logout user1
+	err = ts.Logout()
+	require.NoError(t, err)
+
+	// TODO(kradalby): Not sure why we need to logout twice, but it fails and
+	// logs in immediately after the first logout and I cannot reproduce it
+	// manually.
+	err = ts.Logout()
+	require.NoError(t, err)
+
+	// Wait for logout to complete
+	t.Logf("Waiting for user1 logout completion at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		// Check that the logout completed
+		status, err := ts.Status()
+		assert.NoError(ct, err, "Failed to get client status during logout validation")
+		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after logout, got %s", status.BackendState)
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 logout to complete before same-user relogin")
+
+	// Validate node persistence during logout (node should remain in DB)
+	t.Logf("Validating node persistence during logout at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listNodes, err := headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes during logout validation")
+		assert.Len(ct, listNodes, 1, "Should still have exactly 1 node during logout (node should persist in DB), got %d", len(listNodes))
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating node persistence in database during same-user logout")
+
+	// Login again as the same user (user1)
+	u, err = ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	t.Logf("Waiting for user1 relogin completion at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := ts.Status()
+		assert.NoError(ct, err, "Failed to get client status during relogin validation")
+		assert.Equal(ct, "Running", status.BackendState, "Expected Running state after user1 relogin, got %s", status.BackendState)
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for user1 relogin to complete (same user)")
+
+	t.Logf("Final validation: checking user persistence after same-user relogin at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		listUsers, err := headscale.ListUsers()
+		assert.NoError(ct, err, "Failed to list users during final validation")
+		assert.Len(ct, listUsers, 1, "Should still have exactly 1 user after same-user relogin, got %d", len(listUsers))
+
+		wantUsers := []*clientv1.User{
+			{
+				Id:         "1",
+				Name:       "user1",
+				Email:      "user1@headscale.net",
+				Provider:   "oidc",
+				ProviderId: scenario.mockOIDC.Issuer() + "/user1",
+			},
+		}
+
+		sort.Slice(listUsers, func(i, j int) bool {
+			return mustParseID(listUsers[i].Id) < mustParseID(listUsers[j].Id)
+		})
+
+		if diff := cmp.Diff(wantUsers, listUsers, cmpopts.IgnoreUnexported(clientv1.User{}), cmpopts.IgnoreFields(clientv1.User{}, "CreatedAt")); diff != "" {
+			ct.Errorf("Final user validation failed - user1 should persist after same-user relogin: %s", diff)
+		}
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating user1 persistence after same-user OIDC relogin cycle")
+
+	var finalNodes []*clientv1.Node
+
+	t.Logf("Final node validation: checking node stability after same-user relogin at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		finalNodes, err = headscale.ListNodes()
+		assert.NoError(ct, err, "Failed to list nodes during final validation")
+		assert.Len(ct, finalNodes, 1, "Should have exactly 1 node after same-user relogin, got %d", len(finalNodes))
+
+		// Validate node key behavior for same user relogin
+		finalNode := finalNodes[0]
+
+		// Machine key should be preserved (same physical machine)
+		assert.Equal(ct, initialMachineKey, finalNode.MachineKey, "Machine key should be preserved for same user same node relogin")
+
+		// Node ID should be preserved (same user, same machine)
+		assert.Equal(ct, initialNodeID, finalNode.Id, "Node ID should be preserved for same user same node relogin")
+
+		// Node key should be regenerated (new session after logout)
+		assert.NotEqual(ct, initialNodeKey, finalNode.NodeKey, "Node key should be regenerated after logout/relogin even for same user")
+
+		t.Logf("Final validation complete - same user relogin key relationships verified at %s", time.Now().Format(TimestampFormat))
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "validating final node state after same-user OIDC relogin cycle with key preservation validation")
+
+	// Security validation: user1's node should be active after relogin
+	activeUser1NodeID := types.NodeID(mustParseID(finalNodes[0].Id))
+
+	t.Logf("Validating user1 node is online after same-user relogin at %s", time.Now().Format(TimestampFormat))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodeStore, err := headscale.DebugNodeStore()
+		assert.NoError(c, err, "Failed to get nodestore debug info")
+
+		// Check user1 node is online
+		if node, exists := nodeStore[activeUser1NodeID]; exists {
+			assert.NotNil(c, node.IsOnline, "User1 node should have online status after same-user relogin")
+
+			if node.IsOnline != nil {
+				assert.True(c, *node.IsOnline, "User1 node should be online after same-user relogin")
+			}
+		} else {
+			assert.Fail(c, "User1 node not found in nodestore after same-user relogin")
+		}
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "validating user1 node is online after same-user OIDC relogin")
+}
+
+// TestOIDCExpiryAfterRestart validates that node expiry is preserved
+// when a tailscaled client restarts and reconnects to headscale.
+//
+// This test reproduces the bug reported in https://github.com/juanfont/headscale/issues/2862
+// where OIDC expiry was reset to 0001-01-01 00:00:00 after tailscaled restart.
+//
+// Test flow:
+// 1. Node logs in with OIDC (gets 72h expiry)
+// 2. Verify expiry is set correctly in headscale
+// 3. Restart tailscaled container (simulates daemon restart)
+// 4. Wait for reconnection
+// 5. Verify expiry is still set correctly (not zero).
+func TestOIDCExpiryAfterRestart(t *testing.T) {
+	IntegrationSkip(t)
+
+	scenario, err := NewScenario(ScenarioSpec{
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true),
+		},
+	})
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+		"HEADSCALE_NODE_EXPIRY":             "72h",
+	}
+
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		nil,
+		hsic.WithTestName("oidcexpiry"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	// Create and login tailscale client
+	ts, err := scenario.CreateTailscaleNode("unstable", tsic.WithNetwork(scenario.networks[scenario.testDefaultNetwork]))
+	require.NoError(t, err)
+
+	u, err := ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	t.Logf("Validating initial login and expiry at %s", time.Now().Format(TimestampFormat))
+
+	// Verify initial expiry is set
+	var initialExpiry time.Time
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, nodes, 1)
+
+		node := nodes[0]
+		assert.NotNil(ct, node.Expiry, "Expiry should be set after OIDC login")
+
+		if node.Expiry != nil {
+			expiryTime := *node.Expiry
+			assert.False(ct, expiryTime.IsZero(), "Expiry should not be zero time")
+
+			initialExpiry = expiryTime
+			t.Logf("Initial expiry set to: %v (expires in %v)", expiryTime, time.Until(expiryTime))
+		}
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating initial expiry after OIDC login")
+
+	// Now restart the tailscaled container
+	t.Logf("Restarting tailscaled container at %s", time.Now().Format(TimestampFormat))
+
+	err = ts.Restart()
+	require.NoError(t, err, "Failed to restart tailscaled container")
+
+	t.Logf("Tailscaled restarted, waiting for reconnection at %s", time.Now().Format(TimestampFormat))
+
+	// Wait for the node to come back online
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := ts.Status()
+		if !assert.NoError(ct, err) {
+			return
+		}
+
+		if !assert.NotNil(ct, status) {
+			return
+		}
+
+		assert.Equal(ct, "Running", status.BackendState)
+	}, integrationutil.HAConvergeTimeout, 2*time.Second, "waiting for tailscale to reconnect after restart")
+
+	// THE CRITICAL TEST: Verify expiry is still set correctly after restart
+	t.Logf("Validating expiry preservation after restart at %s", time.Now().Format(TimestampFormat))
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, nodes, 1, "Should still have exactly 1 node after restart")
+
+		node := nodes[0]
+		assert.NotNil(ct, node.Expiry, "Expiry should NOT be nil after restart")
+
+		if node.Expiry != nil {
+			expiryTime := *node.Expiry
+
+			// This is the bug check - expiry should NOT be zero time
+			assert.False(ct, expiryTime.IsZero(),
+				"BUG: Expiry was reset to zero time after tailscaled restart! This is issue #2862")
+
+			// Expiry should be exactly the same as before restart
+			assert.Equal(ct, initialExpiry, expiryTime,
+				"Expiry should be exactly the same after restart, got %v, expected %v",
+				expiryTime, initialExpiry)
+
+			t.Logf("SUCCESS: Expiry preserved after restart: %v (expires in %v)",
+				expiryTime, time.Until(expiryTime))
+		}
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "validating expiry preservation after restart")
+}
+
+// TestOIDCACLPolicyOnJoin validates that ACL policies are correctly applied
+// to newly joined OIDC nodes without requiring a client restart.
+//
+// This test validates the fix for issue #2888:
+// https://github.com/juanfont/headscale/issues/2888
+//
+// Bug: Nodes joining via OIDC authentication did not get the appropriate ACL
+// policy applied until they restarted their client. This was a regression
+// introduced in v0.27.0.
+//
+// The test scenario:
+// 1. Creates a CLI user (gateway) with a node advertising a route
+// 2. Sets up ACL policy allowing all nodes to access advertised routes
+// 3. OIDC user authenticates and joins with a new node
+// 4. Verifies that the OIDC user's node IMMEDIATELY sees the advertised route
+//
+// Expected behavior:
+// - Without fix: OIDC node cannot see the route ([ipnstate.PeerStatus.PrimaryRoutes] is nil/empty)
+// - With fix: OIDC node immediately sees the route in [ipnstate.PeerStatus.PrimaryRoutes]
+//
+// Root cause: The buggy code called a.h.Change(c) immediately after user
+// creation but BEFORE node registration completed, creating a race condition
+// where policy change notifications were sent asynchronously before the node
+// was fully registered.
+func TestOIDCACLPolicyOnJoin(t *testing.T) {
+	IntegrationSkip(t)
+
+	gatewayUser := "gateway"
+	oidcUser := "oidcuser"
+
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{gatewayUser},
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser(oidcUser, true),
+		},
+	}
+
+	scenario, err := NewScenario(spec)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+	}
+
+	// Create headscale environment with ACL policy that allows OIDC user
+	// to access routes advertised by gateway user
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		[]tsic.Option{
+			tsic.WithAcceptRoutes(),
+		},
+		hsic.WithTestName("oidcaclpolicy"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+		hsic.WithACLPolicy(
+			&policyv2.Policy{
+				ACLs: []policyv2.ACL{
+					{
+						Action:  "accept",
+						Sources: []policyv2.Alias{prefixp("100.64.0.0/10")},
+						Destinations: []policyv2.AliasWithPorts{
+							aliasWithPorts(prefixp("100.64.0.0/10"), tailcfg.PortRangeAny),
+							aliasWithPorts(prefixp("10.33.0.0/24"), tailcfg.PortRangeAny),
+							aliasWithPorts(prefixp("10.44.0.0/24"), tailcfg.PortRangeAny),
+						},
+					},
+				},
+				AutoApprovers: policyv2.AutoApproverPolicy{
+					Routes: map[netip.Prefix]policyv2.AutoApprovers{
+						netip.MustParsePrefix("10.33.0.0/24"): {usernameApprover("gateway@test.no"), usernameApprover("oidcuser@headscale.net"), usernameApprover("jane.doe@example.com")},
+						netip.MustParsePrefix("10.44.0.0/24"): {usernameApprover("gateway@test.no"), usernameApprover("oidcuser@headscale.net"), usernameApprover("jane.doe@example.com")},
+					},
+				},
+			},
+		),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	// Get the gateway client (CLI user) - only one client at first
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+	require.Len(t, allClients, 1, "Should have exactly 1 client (gateway) before OIDC login")
+
+	gatewayClient := allClients[0]
+
+	// Wait for initial sync (gateway logs in)
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	// Gateway advertises route 10.33.0.0/24
+	advertiseRoute := "10.33.0.0/24"
+	command := []string{
+		"tailscale",
+		"set",
+		"--advertise-routes=" + advertiseRoute,
+	}
+	_, _, err = gatewayClient.Execute(command)
+	require.NoErrorf(t, err, "failed to advertise route: %s", err)
+
+	// Wait for route advertisement to propagate
+	var gatewayNodeID uint64
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, nodes, 1)
+
+		gatewayNode := nodes[0]
+		gatewayNodeID = mustParseID(gatewayNode.Id)
+		assert.Len(ct, gatewayNode.AvailableRoutes, 1)
+		assert.Contains(ct, gatewayNode.AvailableRoutes, advertiseRoute)
+	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.SlowPoll, "route advertisement should propagate to headscale")
+
+	// Approve the advertised route
+	_, err = headscale.ApproveRoutes(
+		gatewayNodeID,
+		[]netip.Prefix{netip.MustParsePrefix(advertiseRoute)},
+	)
+	require.NoError(t, err)
+
+	// Wait for route approval to propagate
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, nodes, 1)
+
+		gatewayNode := nodes[0]
+		assert.Len(ct, gatewayNode.ApprovedRoutes, 1)
+		assert.Contains(ct, gatewayNode.ApprovedRoutes, advertiseRoute)
+	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.SlowPoll, "route approval should propagate to headscale")
+
+	// NOW create the OIDC user by having them join
+	// This is where issue #2888 manifests - the new OIDC node should immediately
+	// see the gateway's advertised route
+	t.Logf("OIDC user joining at %s", time.Now().Format(TimestampFormat))
+
+	// Create OIDC user's tailscale node
+	oidcAdvertiseRoute := "10.44.0.0/24"
+	oidcClient, err := scenario.CreateTailscaleNode(
+		"head",
+		tsic.WithNetwork(scenario.networks[scenario.testDefaultNetwork]),
+		tsic.WithAcceptRoutes(),
+		tsic.WithExtraLoginArgs([]string{"--advertise-routes=" + oidcAdvertiseRoute}),
+	)
+	require.NoError(t, err)
+
+	// OIDC login happens automatically via LoginWithURL
+	loginURL, err := oidcClient.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(oidcClient.Hostname(), loginURL)
+	require.NoError(t, err)
+
+	t.Logf("OIDC user logged in successfully at %s", time.Now().Format(TimestampFormat))
+
+	// THE CRITICAL TEST: Verify that the OIDC user's node can IMMEDIATELY
+	// see the gateway's advertised route WITHOUT needing a client restart.
+	//
+	// This is where the bug manifests:
+	// - Without fix: [ipnstate.PeerStatus.PrimaryRoutes] will be nil/empty
+	// - With fix: [ipnstate.PeerStatus.PrimaryRoutes] immediately contains the advertised route
+	t.Logf("Verifying OIDC user can immediately see advertised routes at %s", time.Now().Format(TimestampFormat))
+
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := oidcClient.Status()
+		assert.NoError(ct, err)
+
+		// Find the gateway peer in the OIDC user's peer list
+		var gatewayPeer *ipnstate.PeerStatus
+
+		for _, peerKey := range status.Peers() {
+			peer := status.Peer[peerKey]
+			// Gateway is the peer that's not the OIDC user
+			if peer.UserID != status.Self.UserID {
+				gatewayPeer = peer
+				break
+			}
+		}
+
+		assert.NotNil(ct, gatewayPeer, "OIDC user should see gateway as peer")
+
+		if gatewayPeer != nil {
+			// This is the critical assertion - [ipnstate.PeerStatus.PrimaryRoutes] should NOT be nil
+			assert.NotNil(ct, gatewayPeer.PrimaryRoutes,
+				"BUG #2888: Gateway peer PrimaryRoutes is nil - ACL policy not applied to new OIDC node!")
+
+			if gatewayPeer.PrimaryRoutes != nil {
+				routes := gatewayPeer.PrimaryRoutes.AsSlice()
+				assert.Contains(ct, routes, netip.MustParsePrefix(advertiseRoute),
+					"OIDC user should immediately see gateway's advertised route %s in PrimaryRoutes", advertiseRoute)
+				t.Logf("SUCCESS: OIDC user can see advertised route %s in gateway's PrimaryRoutes", advertiseRoute)
+			}
+
+			// Also verify [ipnstate.PeerStatus.AllowedIPs] includes the route
+			if gatewayPeer.AllowedIPs != nil && gatewayPeer.AllowedIPs.Len() > 0 {
+				allowedIPs := gatewayPeer.AllowedIPs.AsSlice()
+				t.Logf("Gateway peer AllowedIPs: %v", allowedIPs)
+			}
+		}
+	}, integrationutil.ScaledTimeout(15*time.Second), integrationutil.SlowPoll,
+		"OIDC user should immediately see gateway's advertised route without client restart (issue #2888)")
+
+	// Verify that the Gateway node sees the OIDC node's advertised route (AutoApproveRoutes check)
+	t.Logf("Verifying Gateway user can immediately see OIDC advertised routes at %s", time.Now().Format(TimestampFormat))
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := gatewayClient.Status()
+		assert.NoError(ct, err)
+
+		// Find the OIDC peer in the Gateway user's peer list
+		var oidcPeer *ipnstate.PeerStatus
+
+		for _, peerKey := range status.Peers() {
+			peer := status.Peer[peerKey]
+			if peer.UserID != status.Self.UserID {
+				oidcPeer = peer
+				break
+			}
+		}
+
+		assert.NotNil(ct, oidcPeer, "Gateway user should see OIDC user as peer")
+
+		if oidcPeer != nil {
+			assert.NotNil(ct, oidcPeer.PrimaryRoutes,
+				"BUG: OIDC peer PrimaryRoutes is nil - AutoApproveRoutes failed or overwritten!")
+
+			if oidcPeer.PrimaryRoutes != nil {
+				routes := oidcPeer.PrimaryRoutes.AsSlice()
+				assert.Contains(ct, routes, netip.MustParsePrefix(oidcAdvertiseRoute),
+					"Gateway user should immediately see OIDC's advertised route %s in PrimaryRoutes", oidcAdvertiseRoute)
+			}
+		}
+	}, integrationutil.ScaledTimeout(15*time.Second), integrationutil.SlowPoll,
+		"Gateway user should immediately see OIDC's advertised route (AutoApproveRoutes check)")
+
+	// Additional validation: Verify nodes in headscale match expectations
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(ct, err)
+		assert.Len(ct, nodes, 2, "Should have 2 nodes (gateway + oidcuser)")
+
+		// Verify OIDC user was created correctly
+		users, err := headscale.ListUsers()
+		assert.NoError(ct, err)
+		// Note: mockoidc may create additional default users (like jane.doe)
+		// so we check for at least 2 users, not exactly 2
+		assert.GreaterOrEqual(ct, len(users), 2, "Should have at least 2 users (gateway CLI user + oidcuser)")
+
+		// Find gateway CLI user
+		var gatewayUser *clientv1.User
+
+		for _, user := range users {
+			if user.Name == "gateway" && user.Provider == "" {
+				gatewayUser = user
+				break
+			}
+		}
+
+		assert.NotNil(ct, gatewayUser, "Should have gateway CLI user")
+
+		if gatewayUser != nil {
+			assert.Equal(ct, "gateway", gatewayUser.Name)
+		}
+
+		// Find OIDC user
+		var oidcUserFound *clientv1.User
+
+		for _, user := range users {
+			if user.Name == "oidcuser" && user.Provider == "oidc" {
+				oidcUserFound = user
+				break
+			}
+		}
+
+		assert.NotNil(ct, oidcUserFound, "Should have OIDC user")
+
+		if oidcUserFound != nil {
+			assert.Equal(ct, "oidcuser", oidcUserFound.Name)
+			assert.Equal(ct, "oidcuser@headscale.net", oidcUserFound.Email)
+		}
+	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.SlowPoll, "headscale should have correct users and nodes")
+
+	t.Logf("Test completed successfully - issue #2888 fix validated")
+}
+
+// TestOIDCReloginSameUserRoutesPreserved tests the scenario where:
+// - A node logs in via OIDC and advertises routes
+// - Routes are auto-approved and verified as SERVING
+// - The node logs out
+// - The node logs back in as the same user
+// - Routes should STILL be SERVING (not just approved/available)
+//
+// This test validates the fix for issue #2896:
+// https://github.com/juanfont/headscale/issues/2896
+//
+// Bug: When a node with already-approved routes restarts/re-authenticates,
+// the routes show as "Approved" and "Available" but NOT "Serving" (Primary).
+// A headscale restart would fix it, indicating a state management issue.
+func TestOIDCReloginSameUserRoutesPreserved(t *testing.T) {
+	IntegrationSkip(t)
+
+	advertiseRoute := "10.55.0.0/24"
+
+	// Create scenario with same user for both login attempts
+	scenario, err := NewScenario(ScenarioSpec{
+		OIDCUsers: []mockoidc.MockUser{
+			oidcMockUser("user1", true), // Initial login
+			oidcMockUser("user1", true), // Relogin with same user
+		},
+	})
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	oidcMap := map[string]string{
+		"HEADSCALE_OIDC_ISSUER":             scenario.mockOIDC.Issuer(),
+		"HEADSCALE_OIDC_CLIENT_ID":          scenario.mockOIDC.ClientID(),
+		"CREDENTIALS_DIRECTORY_TEST":        "/tmp",
+		"HEADSCALE_OIDC_CLIENT_SECRET_PATH": "${CREDENTIALS_DIRECTORY_TEST}/hs_client_oidc_secret",
+	}
+
+	err = scenario.CreateHeadscaleEnvWithLoginURL(
+		[]tsic.Option{
+			tsic.WithAcceptRoutes(),
+		},
+		hsic.WithTestName("oidcrouterelogin"),
+		hsic.WithConfigEnv(oidcMap),
+		hsic.WithFileInContainer("/tmp/hs_client_oidc_secret", []byte(scenario.mockOIDC.ClientSecret())),
+		hsic.WithACLPolicy(
+			&policyv2.Policy{
+				ACLs: []policyv2.ACL{
+					{
+						Action:       "accept",
+						Sources:      []policyv2.Alias{policyv2.Wildcard},
+						Destinations: []policyv2.AliasWithPorts{{Alias: policyv2.Wildcard, Ports: []tailcfg.PortRange{tailcfg.PortRangeAny}}},
+					},
+				},
+				AutoApprovers: policyv2.AutoApproverPolicy{
+					Routes: map[netip.Prefix]policyv2.AutoApprovers{
+						netip.MustParsePrefix(advertiseRoute): {usernameApprover("user1@headscale.net")},
+					},
+				},
+			},
+		),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	// Create client with route advertisement
+	ts, err := scenario.CreateTailscaleNode(
+		"unstable",
+		tsic.WithNetwork(scenario.networks[scenario.testDefaultNetwork]),
+		tsic.WithAcceptRoutes(),
+		tsic.WithExtraLoginArgs([]string{"--advertise-routes=" + advertiseRoute}),
+	)
+	require.NoError(t, err)
+
+	// Initial login as user1
+	u, err := ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	// Wait for client to be running
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := ts.Status()
+		assert.NoError(ct, err)
+		assert.Equal(ct, "Running", status.BackendState)
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for initial login to complete")
+
+	// Step 1: Verify initial route is advertised, approved, and SERVING
+	t.Logf("Step 1: Verifying initial route is advertised, approved, and SERVING at %s", time.Now().Format(TimestampFormat))
+
+	var initialNode *clientv1.Node
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(c, err)
+		assert.Len(c, nodes, 1, "Should have exactly 1 node")
+
+		if len(nodes) == 1 {
+			initialNode = nodes[0]
+			// Check: 1 announced, 1 approved, 1 serving (subnet route)
+			assert.Lenf(c, initialNode.AvailableRoutes, 1,
+				"Node should have 1 available route, got %v", initialNode.AvailableRoutes)
+			assert.Lenf(c, initialNode.ApprovedRoutes, 1,
+				"Node should have 1 approved route, got %v", initialNode.ApprovedRoutes)
+			assert.Lenf(c, initialNode.SubnetRoutes, 1,
+				"Node should have 1 serving (subnet) route, got %v - THIS IS THE BUG if empty", initialNode.SubnetRoutes)
+			assert.Contains(c, initialNode.SubnetRoutes, advertiseRoute,
+				"Subnet routes should contain %s", advertiseRoute)
+		}
+	}, integrationutil.StatusReadyTimeout, integrationutil.SlowPoll, "initial route should be serving")
+
+	require.NotNil(t, initialNode, "Initial node should be found")
+	initialNodeID := initialNode.Id
+	t.Logf("Initial node ID: %s, Available: %v, Approved: %v, Serving: %v",
+		initialNodeID, initialNode.AvailableRoutes, initialNode.ApprovedRoutes, initialNode.SubnetRoutes)
+
+	// Step 2: Logout
+	t.Logf("Step 2: Logging out at %s", time.Now().Format(TimestampFormat))
+
+	err = ts.Logout()
+	require.NoError(t, err)
+
+	// Wait for logout to complete
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := ts.Status()
+		assert.NoError(ct, err)
+		assert.Equal(ct, "NeedsLogin", status.BackendState, "Expected NeedsLogin state after logout")
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for logout to complete")
+
+	t.Logf("Logout completed, node should still exist in database")
+
+	// Verify node still exists (routes should still be in DB)
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(c, err)
+		assert.Len(c, nodes, 1, "Node should persist in database after logout")
+	}, integrationutil.ScaledTimeout(10*time.Second), integrationutil.SlowPoll, "node should persist after logout")
+
+	// Step 3: Re-authenticate via OIDC as the same user
+	t.Logf("Step 3: Re-authenticating with same user via OIDC at %s", time.Now().Format(TimestampFormat))
+
+	u, err = ts.LoginWithURL(headscale.GetEndpoint())
+	require.NoError(t, err)
+
+	_, err = doLoginURL(ts.Hostname(), u)
+	require.NoError(t, err)
+
+	// Wait for client to be running
+	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		status, err := ts.Status()
+		assert.NoError(ct, err)
+		assert.Equal(ct, "Running", status.BackendState, "Expected Running state after relogin")
+	}, integrationutil.StatusReadyTimeout, 1*time.Second, "waiting for relogin to complete")
+
+	t.Logf("Re-authentication completed at %s", time.Now().Format(TimestampFormat))
+
+	// Step 4: THE CRITICAL TEST - Verify routes are STILL SERVING after re-authentication
+	t.Logf("Step 4: Verifying routes are STILL SERVING after re-authentication at %s", time.Now().Format(TimestampFormat))
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodes, err := headscale.ListNodes()
+		assert.NoError(c, err)
+		assert.Len(c, nodes, 1, "Should still have exactly 1 node after relogin")
+
+		if len(nodes) == 1 {
+			node := nodes[0]
+			t.Logf("After relogin - Available: %v, Approved: %v, Serving: %v",
+				node.AvailableRoutes, node.ApprovedRoutes, node.SubnetRoutes)
+
+			// This is where issue #2896 manifests:
+			// - Available shows the route (from [tailcfg.Hostinfo.RoutableIPs])
+			// - Approved shows the route (from [tailcfg.Node.ApprovedRoutes])
+			// - BUT Serving ([tailcfg.Node.SubnetRoutes]/[ipnstate.PeerStatus.PrimaryRoutes]) is EMPTY!
+			assert.Lenf(c, node.AvailableRoutes, 1,
+				"Node should have 1 available route after relogin, got %v", node.AvailableRoutes)
+			assert.Lenf(c, node.ApprovedRoutes, 1,
+				"Node should have 1 approved route after relogin, got %v", node.ApprovedRoutes)
+			assert.Lenf(c, node.SubnetRoutes, 1,
+				"BUG #2896: Node should have 1 SERVING route after relogin, got %v", node.SubnetRoutes)
+			assert.Contains(c, node.SubnetRoutes, advertiseRoute,
+				"BUG #2896: Subnet routes should contain %s after relogin", advertiseRoute)
+
+			// Also verify node ID was preserved (same node, not new registration)
+			assert.Equal(c, initialNodeID, node.Id,
+				"Node ID should be preserved after same-user relogin")
+		}
+	}, integrationutil.StatusReadyTimeout, integrationutil.SlowPoll,
+		"BUG #2896: routes should remain SERVING after OIDC logout/relogin with same user")
+
+	t.Logf("Test completed - verifying issue #2896 fix for OIDC")
 }

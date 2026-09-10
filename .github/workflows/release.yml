@@ -7,19 +7,37 @@ on:
       - "*" # triggers only if push new tag version
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: nix develop --fallback --command bash -e {0}
+
 jobs:
   goreleaser:
+    if: github.repository == 'juanfont/headscale'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Login to DockerHub
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc # main
+      - uses: Mic92/hestia@fb239a2f72d4b6e26eec5425f289dea23b27a527 # v2.0.0
 
       - name: Run goreleaser
-        run: nix develop --command -- goreleaser release --clean
+        run: goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

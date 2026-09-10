@@ -8,206 +8,255 @@ import (
 	"io"
 	"net"
 	"net/http"
-	_ "net/http/pprof" //nolint
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"testing"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/gorilla/mux"
-	grpcMiddleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpcRuntime "github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	"github.com/juanfont/headscale"
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/cenkalti/backoff/v5"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/metrics"
+	apiv1 "github.com/juanfont/headscale/hscontrol/api/v1"
+	apiv2 "github.com/juanfont/headscale/hscontrol/api/v2"
+	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/derp"
 	derpServer "github.com/juanfont/headscale/hscontrol/derp/server"
-	"github.com/juanfont/headscale/hscontrol/notifier"
-	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/dns"
+	"github.com/juanfont/headscale/hscontrol/mapper"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/patrickmn/go-cache"
-	zerolog "github.com/philip-bui/grpc-zerolog"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	zl "github.com/rs/zerolog"
+	"github.com/pkg/profile"
 	"github.com/rs/zerolog/log"
+	"github.com/sasha-s/go-deadlock"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
-	"golang.org/x/oauth2"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/reflection"
-	"google.golang.org/grpc/status"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
+	"tailscale.com/util/dnsname"
 )
 
 var (
 	errSTUNAddressNotSet                   = errors.New("STUN address not set")
-	errUnsupportedDatabase                 = errors.New("unsupported DB")
 	errUnsupportedLetsEncryptChallengeType = errors.New(
 		"unknown value for Lets Encrypt challenge type",
 	)
+	errEmptyInitialDERPMap = errors.New(
+		"initial DERPMap is empty, Headscale requires at least one entry",
+	)
 )
 
-const (
-	AuthPrefix         = "Bearer "
-	updateInterval     = 5000
-	privateKeyFileMode = 0o600
+var (
+	debugDeadlock        = envknob.Bool("HEADSCALE_DEBUG_DEADLOCK")
+	debugDeadlockTimeout = envknob.RegisterDuration("HEADSCALE_DEBUG_DEADLOCK_TIMEOUT")
+)
 
-	registerCacheExpiration = time.Minute * 15
-	registerCacheCleanup    = time.Minute * 20
+func init() {
+	deadlock.Opts.Disable = !debugDeadlock
+	if debugDeadlock {
+		deadlock.Opts.DeadlockTimeout = debugDeadlockTimeout()
+		deadlock.Opts.PrintAllCurrentGoroutines = true
+	}
+}
+
+const (
+	updateInterval     = 5 * time.Second
+	privateKeyFileMode = 0o600
+	headscaleDirPerm   = 0o700
 )
 
 // Headscale represents the base app of the service.
 type Headscale struct {
 	cfg             *types.Config
-	db              *db.HSDatabase
-	dbString        string
-	dbType          string
-	dbDebug         bool
-	privateKey2019  *key.MachinePrivate
+	state           *state.State
 	noisePrivateKey *key.MachinePrivate
+	ephemeralGC     *db.EphemeralGarbageCollector
 
-	DERPMap    *tailcfg.DERPMap
 	DERPServer *derpServer.DERPServer
 
-	ACLPolicy *policy.ACLPolicy
+	// realIPMiddleware is nil when cfg.TrustedProxies is empty; the
+	// router skips the mount and r.RemoteAddr stays as the TCP peer.
+	realIPMiddleware func(http.Handler) http.Handler
 
-	nodeNotifier *notifier.Notifier
+	// Things that generate changes
+	extraRecordMan *dns.ExtraRecordsMan
+	authProvider   AuthProvider
+	mapBatcher     *mapper.Batcher
 
-	oidcProvider *oidc.Provider
-	oauth2Config *oauth2.Config
-
-	registrationCache *cache.Cache
-
-	shutdownChan       chan struct{}
-	pollNetMapStreamWG sync.WaitGroup
+	clientStreamsOpen sync.WaitGroup
 }
 
+var (
+	profilingEnabled = envknob.Bool("HEADSCALE_DEBUG_PROFILING_ENABLED")
+	profilingPath    = envknob.String("HEADSCALE_DEBUG_PROFILING_PATH")
+	tailsqlEnabled   = envknob.Bool("HEADSCALE_DEBUG_TAILSQL_ENABLED")
+	tailsqlStateDir  = envknob.String("HEADSCALE_DEBUG_TAILSQL_STATE_DIR")
+	tailsqlTSKey     = envknob.String("TS_AUTHKEY")
+	dumpConfig       = envknob.Bool("HEADSCALE_DEBUG_DUMP_CONFIG")
+)
+
 func NewHeadscale(cfg *types.Config) (*Headscale, error) {
-	if _, enableProfile := os.LookupEnv("HEADSCALE_PROFILING_ENABLED"); enableProfile {
+	var err error
+
+	if profilingEnabled {
 		runtime.SetBlockProfileRate(1)
 	}
 
-	privateKey, err := readOrCreatePrivateKey(cfg.PrivateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read or create private key: %w", err)
-	}
-
-	// TS2021 requires to have a different key from the legacy protocol.
 	noisePrivateKey, err := readOrCreatePrivateKey(cfg.NoisePrivateKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read or create Noise protocol private key: %w", err)
+		return nil, fmt.Errorf("reading or creating Noise protocol private key: %w", err)
 	}
 
-	if privateKey.Equal(*noisePrivateKey) {
-		return nil, fmt.Errorf("private key and noise private key are the same: %w", err)
+	s, err := state.NewState(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("init state: %w", err)
 	}
-
-	var dbString string
-	switch cfg.DBtype {
-	case db.Postgres:
-		dbString = fmt.Sprintf(
-			"host=%s dbname=%s user=%s",
-			cfg.DBhost,
-			cfg.DBname,
-			cfg.DBuser,
-		)
-
-		if sslEnabled, err := strconv.ParseBool(cfg.DBssl); err == nil {
-			if !sslEnabled {
-				dbString += " sslmode=disable"
-			}
-		} else {
-			dbString += fmt.Sprintf(" sslmode=%s", cfg.DBssl)
-		}
-
-		if cfg.DBport != 0 {
-			dbString += fmt.Sprintf(" port=%d", cfg.DBport)
-		}
-
-		if cfg.DBpass != "" {
-			dbString += fmt.Sprintf(" password=%s", cfg.DBpass)
-		}
-	case db.Sqlite:
-		dbString = cfg.DBpath
-	default:
-		return nil, errUnsupportedDatabase
-	}
-
-	registrationCache := cache.New(
-		registerCacheExpiration,
-		registerCacheCleanup,
-	)
 
 	app := Headscale{
-		cfg:                cfg,
-		dbType:             cfg.DBtype,
-		dbString:           dbString,
-		privateKey2019:     privateKey,
-		noisePrivateKey:    noisePrivateKey,
-		registrationCache:  registrationCache,
-		pollNetMapStreamWG: sync.WaitGroup{},
-		nodeNotifier:       notifier.NewNotifier(),
+		cfg:               cfg,
+		noisePrivateKey:   noisePrivateKey,
+		clientStreamsOpen: sync.WaitGroup{},
+		state:             s,
 	}
 
-	database, err := db.NewHeadscaleDatabase(
-		cfg.DBtype,
-		dbString,
-		app.dbDebug,
-		app.nodeNotifier,
-		cfg.IPPrefixes,
-		cfg.BaseDomain)
-	if err != nil {
-		return nil, err
+	if len(cfg.TrustedProxies) > 0 {
+		app.realIPMiddleware, err = trustedProxyRealIP(cfg.TrustedProxies)
+		if err != nil {
+			return nil, fmt.Errorf("building trusted_proxies middleware: %w", err)
+		}
 	}
 
-	app.db = database
+	// Initialize ephemeral garbage collector
+	ephemeralGC := db.NewEphemeralGarbageCollector(func(ni types.NodeID) {
+		node, ok := app.state.GetNodeByID(ni)
+		if !ok {
+			log.Error().Uint64("node.id", ni.Uint64()).Msg("ephemeral node deletion failed")
+			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("ephemeral node deletion failed because node not found in NodeStore")
 
+			return
+		}
+
+		policyChanged, err := app.state.DeleteNode(node)
+		if !policyChanged.IsEmpty() {
+			app.Change(policyChanged)
+		}
+
+		if err != nil {
+			log.Error().Err(err).EmbedObject(node).Msg("ephemeral node deletion failed")
+			return
+		}
+
+		log.Debug().Caller().EmbedObject(node).Msg("ephemeral node deleted because garbage collection timeout reached")
+	})
+	app.ephemeralGC = ephemeralGC
+
+	var authProvider AuthProvider
+
+	authProvider = NewAuthProviderWeb(cfg.ServerURL)
 	if cfg.OIDC.Issuer != "" {
-		err = app.initOIDC()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		oidcProvider, err := NewAuthProviderOIDC(
+			ctx,
+			&app,
+			cfg.ServerURL,
+			&cfg.OIDC,
+		)
 		if err != nil {
 			if cfg.OIDC.OnlyStartIfOIDCIsAvailable {
 				return nil, err
 			} else {
 				log.Warn().Err(err).Msg("failed to set up OIDC provider, falling back to CLI based authentication")
 			}
+		} else {
+			authProvider = oidcProvider
 		}
 	}
 
-	if app.cfg.DNSConfig != nil && app.cfg.DNSConfig.Proxied { // if MagicDNS
-		magicDNSDomains := util.GenerateMagicDNSRootDomains(app.cfg.IPPrefixes)
-		// we might have routes already from Split DNS
-		if app.cfg.DNSConfig.Routes == nil {
-			app.cfg.DNSConfig.Routes = make(map[string][]*dnstype.Resolver)
+	app.authProvider = authProvider
+
+	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
+		// TODO(kradalby): revisit why this takes a list.
+		var magicDNSDomains []dnsname.FQDN
+		if cfg.PrefixV4 != nil {
+			magicDNSDomains = append(
+				magicDNSDomains,
+				util.GenerateIPv4DNSRootDomain(*cfg.PrefixV4)...,
+			)
 		}
+
+		if cfg.PrefixV6 != nil {
+			magicDNSDomains = append(
+				magicDNSDomains,
+				util.GenerateIPv6DNSRootDomain(*cfg.PrefixV6)...,
+			)
+		}
+
+		// we might have routes already from Split DNS
+		if app.cfg.TailcfgDNSConfig.Routes == nil {
+			app.cfg.TailcfgDNSConfig.Routes = make(map[string][]*dnstype.Resolver)
+		}
+
 		for _, d := range magicDNSDomains {
-			app.cfg.DNSConfig.Routes[d.WithoutTrailingDot()] = nil
+			// Empty non-nil slice rather than nil: tailcfg.DNSConfig.Clone
+			// and dns.Config.Clone in tailscale drop map entries whose
+			// value is nil (see tailscale.com/tailcfg/tailcfg_clone.go and
+			// tailscale.com/net/dns/dns_clone.go: `if sv == nil { continue }`).
+			// Sending nil here caused the client's wgengine LinkChange:major
+			// handler to clobber /etc/resolv.conf on every tunnel-IP rebind
+			// — the handler reapplies a Clone of lastDNSConfig and the magic
+			// DNS routes vanish, taking the resolver with them for ~6 min
+			// until the next route-changing netmap. Empty slice survives
+			// Clone and carries the same "resolve locally" semantics
+			// (tailscale.com/ipn/ipnlocal/node_backend.go:869 documents the
+			// empty-resolver Routes form for Issue 2706).
+			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
 		}
 	}
 
 	if cfg.DERP.ServerEnabled {
-		// TODO(kradalby): replace this key with a dedicated DERP key.
+		derpServerKey, err := readOrCreatePrivateKey(cfg.DERP.ServerPrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading or creating DERP server private key: %w", err)
+		}
+
+		if derpServerKey.Equal(*noisePrivateKey) {
+			return nil, fmt.Errorf(
+				"DERP server private key and noise private key are the same: %w",
+				err,
+			)
+		}
+
+		if cfg.DERP.ServerVerifyClients {
+			t := http.DefaultTransport.(*http.Transport) //nolint:forcetypeassert
+			t.RegisterProtocol(
+				derpServer.DerpVerifyScheme,
+				derpServer.NewDERPVerifyTransport(app.handleVerifyRequest),
+			)
+		}
+
 		embeddedDERPServer, err := derpServer.NewDERPServer(
 			cfg.ServerURL,
-			key.NodePrivate(*privateKey),
+			key.NodePrivate(*derpServerKey),
 			&cfg.DERP,
 		)
 		if err != nil {
 			return nil, err
 		}
+
 		app.DERPServer = embeddedDERPServer
 	}
 
@@ -217,276 +266,288 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 // Redirect to our TLS url.
 func (h *Headscale) redirect(w http.ResponseWriter, req *http.Request) {
 	target := h.cfg.ServerURL + req.URL.RequestURI()
-	http.Redirect(w, req, target, http.StatusFound)
+	http.Redirect(w, req, target, http.StatusFound) //nolint:gosec // G710: target prefixed by trusted ServerURL
 }
 
-// expireEphemeralNodes deletes ephemeral node records that have not been
-// seen for longer than h.cfg.EphemeralNodeInactivityTimeout.
-func (h *Headscale) expireEphemeralNodes(milliSeconds int64) {
-	ticker := time.NewTicker(time.Duration(milliSeconds) * time.Millisecond)
-	for range ticker.C {
-		h.db.ExpireEphemeralNodes(h.cfg.EphemeralNodeInactivityTimeout)
+func (h *Headscale) scheduledTasks(ctx context.Context) {
+	expireTicker := time.NewTicker(updateInterval)
+	defer expireTicker.Stop()
+
+	lastExpiryCheck := time.Unix(0, 0)
+
+	var derpTickerChan <-chan time.Time
+
+	if h.cfg.DERP.AutoUpdate && h.cfg.DERP.UpdateFrequency != 0 {
+		derpTicker := time.NewTicker(h.cfg.DERP.UpdateFrequency)
+		defer derpTicker.Stop()
+
+		derpTickerChan = derpTicker.C
 	}
-}
 
-// expireExpiredMachines expires nodes that have an explicit expiry set
-// after that expiry time has passed.
-func (h *Headscale) expireExpiredMachines(intervalMs int64) {
-	interval := time.Duration(intervalMs) * time.Millisecond
-	ticker := time.NewTicker(interval)
-
-	lastCheck := time.Unix(0, 0)
-
-	for range ticker.C {
-		lastCheck = h.db.ExpireExpiredNodes(lastCheck)
+	var extraRecordsUpdate <-chan []tailcfg.DNSRecord
+	if h.extraRecordMan != nil {
+		extraRecordsUpdate = h.extraRecordMan.UpdateCh()
 	}
-}
 
-// scheduledDERPMapUpdateWorker refreshes the DERPMap stored on the global object
-// at a set interval.
-func (h *Headscale) scheduledDERPMapUpdateWorker(cancelChan <-chan struct{}) {
-	log.Info().
-		Dur("frequency", h.cfg.DERP.UpdateFrequency).
-		Msg("Setting up a DERPMap update worker")
-	ticker := time.NewTicker(h.cfg.DERP.UpdateFrequency)
+	var (
+		haProber     *state.HAHealthProber
+		haHealthChan <-chan time.Time
+	)
+	if h.cfg.Node.Routes.HA.ProbeInterval > 0 {
+		haProber = state.NewHAHealthProber(
+			h.state,
+			h.cfg.Node.Routes.HA,
+			h.cfg.ServerURL,
+			h.mapBatcher.IsConnected,
+		)
+
+		haTicker := time.NewTicker(h.cfg.Node.Routes.HA.ProbeInterval)
+		defer haTicker.Stop()
+
+		haHealthChan = haTicker.C
+
+		log.Info().
+			Dur("interval", h.cfg.Node.Routes.HA.ProbeInterval).
+			Dur("timeout", h.cfg.Node.Routes.HA.ProbeTimeout).
+			Msg("HA subnet router health probing enabled")
+	}
+
+	var revokedKeyGCChan <-chan time.Time
+
+	if h.cfg.PreAuthKeys.RevokedRetention > 0 {
+		revokedKeyTicker := time.NewTicker(time.Hour)
+		defer revokedKeyTicker.Stop()
+
+		revokedKeyGCChan = revokedKeyTicker.C
+	}
+
+	// OAuth access tokens are short-lived (1h) and re-minted on demand; reap
+	// expired rows hourly so the table stays bounded.
+	accessTokenTicker := time.NewTicker(time.Hour)
+	defer accessTokenTicker.Stop()
 
 	for {
 		select {
-		case <-cancelChan:
+		case <-ctx.Done():
+			log.Info().Caller().Msg("scheduled task worker is shutting down.")
 			return
 
-		case <-ticker.C:
-			log.Info().Msg("Fetching DERPMap updates")
-			h.DERPMap = derp.GetDERPMap(h.cfg.DERP)
-			if h.cfg.DERP.ServerEnabled {
-				region, _ := h.DERPServer.GenerateRegion()
-				h.DERPMap.Regions[region.RegionID] = &region
-			}
+		case <-revokedKeyGCChan:
+			cutoff := time.Now().Add(-h.cfg.PreAuthKeys.RevokedRetention)
 
-			h.nodeNotifier.NotifyAll(types.StateUpdate{
-				Type:    types.StateDERPUpdated,
-				DERPMap: *h.DERPMap,
-			})
-		}
-	}
-}
-
-func (h *Headscale) failoverSubnetRoutes(milliSeconds int64) {
-	ticker := time.NewTicker(time.Duration(milliSeconds) * time.Millisecond)
-	for range ticker.C {
-		err := h.db.HandlePrimarySubnetFailover()
-		if err != nil {
-			log.Error().Err(err).Msg("failed to handle primary subnet failover")
-		}
-	}
-}
-
-func (h *Headscale) grpcAuthenticationInterceptor(ctx context.Context,
-	req interface{},
-	info *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (interface{}, error) {
-	// Check if the request is coming from the on-server client.
-	// This is not secure, but it is to maintain maintainability
-	// with the "legacy" database-based client
-	// It is also neede for grpc-gateway to be able to connect to
-	// the server
-	client, _ := peer.FromContext(ctx)
-
-	log.Trace().
-		Caller().
-		Str("client_address", client.Addr.String()).
-		Msg("Client is trying to authenticate")
-
-	meta, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		log.Error().
-			Caller().
-			Str("client_address", client.Addr.String()).
-			Msg("Retrieving metadata is failed")
-
-		return ctx, status.Errorf(
-			codes.InvalidArgument,
-			"Retrieving metadata is failed",
-		)
-	}
-
-	authHeader, ok := meta["authorization"]
-	if !ok {
-		log.Error().
-			Caller().
-			Str("client_address", client.Addr.String()).
-			Msg("Authorization token is not supplied")
-
-		return ctx, status.Errorf(
-			codes.Unauthenticated,
-			"Authorization token is not supplied",
-		)
-	}
-
-	token := authHeader[0]
-
-	if !strings.HasPrefix(token, AuthPrefix) {
-		log.Error().
-			Caller().
-			Str("client_address", client.Addr.String()).
-			Msg(`missing "Bearer " prefix in "Authorization" header`)
-
-		return ctx, status.Error(
-			codes.Unauthenticated,
-			`missing "Bearer " prefix in "Authorization" header`,
-		)
-	}
-
-	valid, err := h.db.ValidateAPIKey(strings.TrimPrefix(token, AuthPrefix))
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("client_address", client.Addr.String()).
-			Msg("failed to validate token")
-
-		return ctx, status.Error(codes.Internal, "failed to validate token")
-	}
-
-	if !valid {
-		log.Info().
-			Str("client_address", client.Addr.String()).
-			Msg("invalid token")
-
-		return ctx, status.Error(codes.Unauthenticated, "invalid token")
-	}
-
-	return handler(ctx, req)
-}
-
-func (h *Headscale) httpAuthenticationMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(
-		writer http.ResponseWriter,
-		req *http.Request,
-	) {
-		log.Trace().
-			Caller().
-			Str("client_address", req.RemoteAddr).
-			Msg("HTTP authentication invoked")
-
-		authHeader := req.Header.Get("authorization")
-
-		if !strings.HasPrefix(authHeader, AuthPrefix) {
-			log.Error().
-				Caller().
-				Str("client_address", req.RemoteAddr).
-				Msg(`missing "Bearer " prefix in "Authorization" header`)
-			writer.WriteHeader(http.StatusUnauthorized)
-			_, err := writer.Write([]byte("Unauthorized"))
+			reaped, err := h.state.DestroyRevokedPreAuthKeysBefore(cutoff)
 			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
+				log.Error().Err(err).Msg("reaping revoked pre-auth keys")
+			} else if reaped > 0 {
+				log.Info().Int("count", reaped).Msg("reaped revoked pre-auth keys")
 			}
 
-			return
-		}
-
-		valid, err := h.db.ValidateAPIKey(strings.TrimPrefix(authHeader, AuthPrefix))
-		if err != nil {
-			log.Error().
-				Caller().
-				Err(err).
-				Str("client_address", req.RemoteAddr).
-				Msg("failed to validate token")
-
-			writer.WriteHeader(http.StatusInternalServerError)
-			_, err := writer.Write([]byte("Unauthorized"))
+		case <-accessTokenTicker.C:
+			reaped, err := h.state.DeleteExpiredAccessTokens(time.Now())
 			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
+				log.Error().Err(err).Msg("reaping expired oauth access tokens")
+			} else if reaped > 0 {
+				log.Debug().Int64("count", reaped).Msg("reaped expired oauth access tokens")
 			}
 
-			return
-		}
+		case <-expireTicker.C:
+			var (
+				expiredNodeChanges []change.Change
+				changed            bool
+			)
 
-		if !valid {
-			log.Info().
-				Str("client_address", req.RemoteAddr).
-				Msg("invalid token")
+			lastExpiryCheck, expiredNodeChanges, changed = h.state.ExpireExpiredNodes(lastExpiryCheck)
 
-			writer.WriteHeader(http.StatusUnauthorized)
-			_, err := writer.Write([]byte("Unauthorized"))
+			if changed {
+				log.Trace().Interface("changes", expiredNodeChanges).Msgf("expiring nodes")
+
+				// Send the changes directly since they're already in the new format
+				for _, nodeChange := range expiredNodeChanges {
+					h.Change(nodeChange)
+				}
+			}
+
+		case <-derpTickerChan:
+			log.Info().Msg("fetching DERPMap updates")
+
+			derpMap, err := backoff.Retry(ctx, func() (*tailcfg.DERPMap, error) { //nolint:contextcheck
+				derpMap, err := derp.GetDERPMap(h.cfg.DERP)
+				if err != nil {
+					return nil, err
+				}
+
+				if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
+					region, _ := h.DERPServer.GenerateRegion()
+					derpMap.Regions[region.RegionID] = &region
+				}
+
+				return derpMap, nil
+			}, backoff.WithBackOff(backoff.NewExponentialBackOff()))
 			if err != nil {
-				log.Error().
-					Caller().
-					Err(err).
-					Msg("Failed to write response")
+				log.Error().Err(err).Msg("failed to build new DERPMap, retrying later")
+				continue
 			}
 
-			return
-		}
+			h.state.SetDERPMap(derpMap)
 
-		next.ServeHTTP(writer, req)
-	})
+			h.Change(change.DERPMap())
+
+		case records, ok := <-extraRecordsUpdate:
+			if !ok {
+				continue
+			}
+
+			h.cfg.SetExtraRecords(records)
+
+			h.Change(change.ExtraRecords())
+
+		case <-haHealthChan:
+			haProber.ProbeOnce(ctx, h.Change)
+		}
+	}
 }
 
 // ensureUnixSocketIsAbsent will check if the given path for headscales unix socket is clear
 // and will remove it if it is not.
 func (h *Headscale) ensureUnixSocketIsAbsent() error {
 	// File does not exist, all fine
-	if _, err := os.Stat(h.cfg.UnixSocket); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(h.cfg.UnixSocket); errors.Is(err, os.ErrNotExist) { //nolint:noinlineerr
 		return nil
 	}
 
 	return os.Remove(h.cfg.UnixSocket)
 }
 
-func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *mux.Router {
-	router := mux.NewRouter()
-	router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
-
-	router.HandleFunc(ts2021UpgradePath, h.NoiseUpgradeHandler).Methods(http.MethodPost)
-
-	router.HandleFunc("/health", h.HealthHandler).Methods(http.MethodGet)
-	router.HandleFunc("/key", h.KeyHandler).Methods(http.MethodGet)
-	router.HandleFunc("/register/{nkey}", h.RegisterWebAPI).Methods(http.MethodGet)
-	h.addLegacyHandlers(router)
-
-	router.HandleFunc("/oidc/register/{nkey}", h.RegisterOIDC).Methods(http.MethodGet)
-	router.HandleFunc("/oidc/callback", h.OIDCCallback).Methods(http.MethodGet)
-	router.HandleFunc("/apple", h.AppleConfigMessage).Methods(http.MethodGet)
-	router.HandleFunc("/apple/{platform}", h.ApplePlatformConfig).
-		Methods(http.MethodGet)
-	router.HandleFunc("/windows", h.WindowsConfigMessage).Methods(http.MethodGet)
-	router.HandleFunc("/windows/tailscale.reg", h.WindowsRegConfig).
-		Methods(http.MethodGet)
-
-	// TODO(kristoffer): move swagger into a package
-	router.HandleFunc("/swagger", headscale.SwaggerUI).Methods(http.MethodGet)
-	router.HandleFunc("/swagger/v1/openapiv2.json", headscale.SwaggerAPIv1).
-		Methods(http.MethodGet)
-
-	if h.cfg.DERP.ServerEnabled {
-		router.HandleFunc("/derp", h.DERPServer.DERPHandler)
-		router.HandleFunc("/derp/probe", derpServer.DERPProbeHandler)
-		router.HandleFunc("/bootstrap-dns", derpServer.DERPBootstrapDNSHandler(h.DERPMap))
-	}
-
-	apiRouter := router.PathPrefix("/api").Subrouter()
-	apiRouter.Use(h.httpAuthenticationMiddleware)
-	apiRouter.PathPrefix("/v1/").HandlerFunc(grpcMux.ServeHTTP)
-
-	router.PathPrefix("/").HandlerFunc(notFoundHandler)
-
-	return router
+// securityHeaders sets baseline response headers on every HTTP response:
+// deny framing (clickjacking), forbid MIME-type sniffing, drop the Referer
+// header on outbound navigation. Cheap defense-in-depth for HTML surfaces.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
-// Serve launches a GIN server with the Headscale API.
+// serveHumaMux dispatches to a Huma mux mounted under the outer chi router.
+// Huma registers operations at absolute paths (/api/v1/...), so chi's route
+// context must be cleared for the inner mux to re-match against the original URL.
+func serveHumaMux(mux http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		mux.ServeHTTP(w, req.WithContext(
+			context.WithValue(req.Context(), chi.RouteCtxKey, nil),
+		))
+	}
+}
+
+func (h *Headscale) createRouter(apiV1Mux, apiV2Mux http.Handler) *chi.Mux {
+	r := chi.NewRouter()
+	r.Use(metrics.Collector(metrics.CollectorOpts{
+		Host:  false,
+		Proto: true,
+		Skip: func(r *http.Request) bool {
+			return r.Method == http.MethodOptions
+		},
+	}))
+	r.Use(middleware.RequestID)
+
+	if h.realIPMiddleware != nil {
+		r.Use(h.realIPMiddleware)
+	}
+
+	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
+	r.Use(middleware.Recoverer)
+	r.Use(securityHeaders)
+
+	// TS2021 accepts both the native client's HTTP POST upgrade and the
+	// browser/WASM client's WebSocket GET upgrade; NoiseUpgradeHandler
+	// dispatches on the Upgrade header, not the method. Registering GET as
+	// well keeps the router from rejecting the WebSocket handshake with 405.
+	r.Get(ts2021UpgradePath, h.NoiseUpgradeHandler)
+	r.Post(ts2021UpgradePath, h.NoiseUpgradeHandler)
+
+	r.Get("/robots.txt", h.RobotsHandler)
+	r.Get("/health", h.HealthHandler)
+	r.Get("/version", h.VersionHandler)
+	r.Get("/key", h.KeyHandler)
+	r.Get("/register/{auth_id}", h.authProvider.RegisterHandler)
+	r.Get("/auth/{auth_id}", h.authProvider.AuthHandler)
+
+	if provider, ok := h.authProvider.(*AuthProviderOIDC); ok {
+		r.Get("/oidc/callback", provider.OIDCCallbackHandler)
+		r.Get("/register/confirm/{auth_id}", provider.RegisterConfirmGetHandler)
+		r.Post("/register/confirm/{auth_id}", provider.RegisterConfirmHandler)
+	}
+
+	r.Get("/apple", h.AppleConfigMessage)
+	r.Get("/apple/{platform}", h.ApplePlatformConfig)
+	r.Get("/windows", h.WindowsConfigMessage)
+
+	r.Post("/verify", h.VerifyHandler)
+
+	if h.cfg.DERP.ServerEnabled {
+		r.HandleFunc("/derp", h.DERPServer.DERPHandler)
+		r.HandleFunc("/derp/probe", derpServer.DERPProbeHandler)
+		r.HandleFunc("/derp/latency-check", derpServer.DERPProbeHandler)
+		r.HandleFunc("/bootstrap-dns", derpServer.DERPBootstrapDNSHandler(h.state.DERPMap()))
+	}
+
+	// Auth is enforced inside each Huma mux per-operation, so the whole API
+	// mounts as one handler per version: operations need an API key while the
+	// OpenAPI document and docs UI stay public. v1 is the headscale-native admin
+	// API; v2 is Headscale's v2 API, which ports some endpoints from Tailscale.
+	r.Route("/api", func(r chi.Router) {
+		r.Handle("/v1/*", serveHumaMux(apiV1Mux))
+		r.Handle("/v2/*", serveHumaMux(apiV2Mux))
+	})
+	// Ping response endpoint: receives HEAD from clients responding
+	// to a [tailcfg.PingRequest]. The unguessable ping ID serves as authentication.
+	r.Head("/machine/ping-response", h.PingResponseHandler)
+
+	r.Get("/favicon.ico", FaviconHandler)
+	r.Get("/", BlankHandler)
+
+	return r
+}
+
+// Serve launches the HTTP servers that run Headscale and its API.
+//
+//nolint:gocyclo // complex server startup function
 func (h *Headscale) Serve() error {
 	var err error
 
-	// Fetch an initial DERP Map before we start serving
-	h.DERPMap = derp.GetDERPMap(h.cfg.DERP)
+	capver.CanOldCodeBeCleanedUp()
+
+	if profilingEnabled {
+		if profilingPath != "" {
+			err = os.MkdirAll(profilingPath, os.ModePerm)
+			if err != nil {
+				log.Fatal().Err(err).Msg("failed to create profiling directory")
+			}
+
+			defer profile.Start(profile.ProfilePath(profilingPath)).Stop()
+		} else {
+			defer profile.Start().Stop()
+		}
+	}
+
+	if dumpConfig {
+		spew.Dump(h.cfg)
+	}
+
+	versionInfo := types.GetVersionInfo()
+	log.Info().Str("version", versionInfo.Version).Str("commit", versionInfo.Commit).Msg("starting headscale")
+	log.Info().
+		Str("minimum_version", capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)).
+		Msg("Clients with a lower minimum version will be rejected")
+
+	h.mapBatcher = mapper.NewBatcherAndMapper(h.cfg, h.state)
+
+	h.mapBatcher.Start()
+	defer h.mapBatcher.Close()
 
 	if h.cfg.DERP.ServerEnabled {
 		// When embedded DERP is enabled we always need a STUN server
@@ -494,39 +555,60 @@ func (h *Headscale) Serve() error {
 			return errSTUNAddressNotSet
 		}
 
-		region, err := h.DERPServer.GenerateRegion()
-		if err != nil {
-			return err
-		}
-
-		h.DERPMap.Regions[region.RegionID] = &region
-
 		go h.DERPServer.ServeSTUN()
 	}
 
-	if h.cfg.DERP.AutoUpdate {
-		derpMapCancelChannel := make(chan struct{})
-		defer func() { derpMapCancelChannel <- struct{}{} }()
-		go h.scheduledDERPMapUpdateWorker(derpMapCancelChannel)
+	derpMap, err := derp.GetDERPMap(h.cfg.DERP)
+	if err != nil {
+		return fmt.Errorf("getting DERPMap: %w", err)
 	}
 
-	// TODO(kradalby): These should have cancel channels and be cleaned
-	// up on shutdown.
-	go h.expireEphemeralNodes(updateInterval)
-	go h.expireExpiredMachines(updateInterval)
-
-	go h.failoverSubnetRoutes(updateInterval)
-
-	if zl.GlobalLevel() == zl.TraceLevel {
-		zerolog.RespLog = true
-	} else {
-		zerolog.RespLog = false
+	if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
+		region, _ := h.DERPServer.GenerateRegion()
+		derpMap.Regions[region.RegionID] = &region
 	}
+
+	if len(derpMap.Regions) == 0 {
+		return errEmptyInitialDERPMap
+	}
+
+	h.state.SetDERPMap(derpMap)
+
+	// Start ephemeral node garbage collector and schedule all nodes
+	// that are already in the database and ephemeral. If they are still
+	// around between restarts, they will reconnect and the GC will
+	// be cancelled.
+	go h.ephemeralGC.Start()
+
+	ephmNodes := h.state.ListEphemeralNodes()
+	for _, node := range ephmNodes.All() {
+		h.ephemeralGC.Schedule(node.ID(), h.cfg.Node.Ephemeral.InactivityTimeout)
+	}
+
+	if h.cfg.DNSConfig.ExtraRecordsPath != "" {
+		h.extraRecordMan, err = dns.NewExtraRecordsManager(h.cfg.DNSConfig.ExtraRecordsPath)
+		if err != nil {
+			return fmt.Errorf("setting up extrarecord manager: %w", err)
+		}
+
+		h.cfg.SetExtraRecords(h.extraRecordMan.Records())
+
+		go h.extraRecordMan.Run()
+		defer h.extraRecordMan.Close()
+	}
+
+	// Start all scheduled tasks, e.g. expiring nodes, derp updates and
+	// records updates
+	scheduleCtx, scheduleCancel := context.WithCancel(context.Background())
+	defer scheduleCancel()
+
+	go h.scheduledTasks(scheduleCtx)
 
 	// Prepare group for running listeners
 	errorGroup := new(errgroup.Group)
 
 	ctx := context.Background()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -537,47 +619,59 @@ func (h *Headscale) Serve() error {
 
 	err = h.ensureUnixSocketIsAbsent()
 	if err != nil {
-		return fmt.Errorf("unable to remove old socket file: %w", err)
+		return fmt.Errorf("removing old socket file: %w", err)
 	}
 
-	socketListener, err := net.Listen("unix", h.cfg.UnixSocket)
+	socketDir := filepath.Dir(h.cfg.UnixSocket)
+
+	err = util.EnsureDir(socketDir)
 	if err != nil {
-		return fmt.Errorf("failed to set up gRPC socket: %w", err)
+		return fmt.Errorf("setting up unix socket: %w", err)
+	}
+
+	socketListener, err := new(net.ListenConfig).Listen(context.Background(), "unix", h.cfg.UnixSocket)
+	if err != nil {
+		return fmt.Errorf("setting up socket: %w", err)
 	}
 
 	// Change socket permissions
-	if err := os.Chmod(h.cfg.UnixSocket, h.cfg.UnixSocketPermission); err != nil {
-		return fmt.Errorf("failed change permission of gRPC socket: %w", err)
+	if err := os.Chmod(h.cfg.UnixSocket, h.cfg.UnixSocketPermission); err != nil { //nolint:noinlineerr
+		return fmt.Errorf("changing socket permission: %w", err)
 	}
 
-	grpcGatewayMux := grpcRuntime.NewServeMux()
+	// The Huma v1 API mux matches full /api/v1/... paths and is shared by
+	// the local unix socket (served without authentication, local trust)
+	// and the remote TCP router (served behind the API-key middleware).
+	humaMux, _ := apiv1.Handler(apiv1.Backend{
+		State:  h.state,
+		Change: h.Change,
+		Cfg:    h.cfg,
+	})
 
-	// Make the grpc-gateway connect to grpc over socket
-	grpcGatewayConn, err := grpc.Dial(
-		h.cfg.UnixSocket,
-		[]grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithContextDialer(util.GrpcSocketDialer),
-		}...,
-	)
-	if err != nil {
-		return err
+	// The Headscale v2 API. Served behind Basic/Bearer auth on the remote
+	// listener, and over the local unix socket (local trust) so the CLI can
+	// manage OAuth clients through the same v2 keys handler the Tailscale
+	// ecosystem uses.
+	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
+		State:  h.state,
+		Change: h.Change,
+		Cfg:    h.cfg,
+	})
+
+	// Serve both Huma APIs over the unix socket without TLS or auth: socket
+	// access implies trust. WithLocalTrust marks these requests so each API's
+	// security middleware skips the credential check. v2 paths route to the v2
+	// mux; everything else (the v1 paths) to v1.
+	socketHandler := http.NewServeMux()
+	socketHandler.Handle("/api/v2/", apiv2.WithLocalTrust(humaV2Mux))
+	socketHandler.Handle("/", apiv1.WithLocalTrust(humaMux))
+
+	socketServer := &http.Server{
+		Handler:     socketHandler,
+		ReadTimeout: types.HTTPTimeout,
 	}
 
-	// Connect to the gRPC server over localhost to skip
-	// the authentication.
-	err = v1.RegisterHeadscaleServiceHandler(ctx, grpcGatewayMux, grpcGatewayConn)
-	if err != nil {
-		return err
-	}
-
-	// Start the local gRPC server without TLS and without authentication
-	grpcSocket := grpc.NewServer(zerolog.UnaryInterceptor())
-
-	v1.RegisterHeadscaleServiceServer(grpcSocket, newHeadscaleV1APIServer(h))
-	reflection.Register(grpcSocket)
-
-	errorGroup.Go(func() error { return grpcSocket.Serve(socketListener) })
+	errorGroup.Go(func() error { return socketServer.Serve(socketListener) })
 
 	//
 	//
@@ -586,59 +680,7 @@ func (h *Headscale) Serve() error {
 
 	tlsConfig, err := h.getTLSSettings()
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to set up TLS configuration")
-
-		return err
-	}
-
-	//
-	//
-	// gRPC setup
-	//
-
-	// We are sadly not able to run gRPC and HTTPS (2.0) on the same
-	// port because the connection mux does not support matching them
-	// since they are so similar. There is multiple issues open and we
-	// can revisit this if changes:
-	// https://github.com/soheilhy/cmux/issues/68
-	// https://github.com/soheilhy/cmux/issues/91
-
-	var grpcServer *grpc.Server
-	var grpcListener net.Listener
-	if tlsConfig != nil || h.cfg.GRPCAllowInsecure {
-		log.Info().Msgf("Enabling remote gRPC at %s", h.cfg.GRPCAddr)
-
-		grpcOptions := []grpc.ServerOption{
-			grpc.UnaryInterceptor(
-				grpcMiddleware.ChainUnaryServer(
-					h.grpcAuthenticationInterceptor,
-					zerolog.NewUnaryServerInterceptor(),
-				),
-			),
-		}
-
-		if tlsConfig != nil {
-			grpcOptions = append(grpcOptions,
-				grpc.Creds(credentials.NewTLS(tlsConfig)),
-			)
-		} else {
-			log.Warn().Msg("gRPC is running without security")
-		}
-
-		grpcServer = grpc.NewServer(grpcOptions...)
-
-		v1.RegisterHeadscaleServiceServer(grpcServer, newHeadscaleV1APIServer(h))
-		reflection.Register(grpcServer)
-
-		grpcListener, err = net.Listen("tcp", h.cfg.GRPCAddr)
-		if err != nil {
-			return fmt.Errorf("failed to bind to TCP address: %w", err)
-		}
-
-		errorGroup.Go(func() error { return grpcServer.Serve(grpcListener) })
-
-		log.Info().
-			Msgf("listening and serving gRPC on: %s", h.cfg.GRPCAddr)
+		return fmt.Errorf("configuring TLS settings: %w", err)
 	}
 
 	//
@@ -646,29 +688,30 @@ func (h *Headscale) Serve() error {
 	// HTTP setup
 	//
 	// This is the regular router that we expose
-	// over our main Addr. It also serves the legacy Tailcale API
-	router := h.createRouter(grpcGatewayMux)
+	// over our main Addr
+	router := h.createRouter(humaMux, humaV2Mux)
 
 	httpServer := &http.Server{
 		Addr:        h.cfg.Addr,
 		Handler:     router,
-		ReadTimeout: types.HTTPReadTimeout,
-		// Go does not handle timeouts in HTTP very well, and there is
-		// no good way to handle streaming timeouts, therefore we need to
-		// keep this at unlimited and be careful to clean up connections
-		// https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/#aboutstreaming
-		WriteTimeout: 0,
+		ReadTimeout: types.HTTPTimeout,
+
+		// Long polling should not have any timeout, this is overridden
+		// further down the chain
+		WriteTimeout: types.HTTPTimeout,
 	}
 
 	var httpListener net.Listener
+
 	if tlsConfig != nil {
 		httpServer.TLSConfig = tlsConfig
 		httpListener, err = tls.Listen("tcp", h.cfg.Addr, tlsConfig)
 	} else {
-		httpListener, err = net.Listen("tcp", h.cfg.Addr)
+		httpListener, err = new(net.ListenConfig).Listen(context.Background(), "tcp", h.cfg.Addr)
 	}
+
 	if err != nil {
-		return fmt.Errorf("failed to bind to TCP address: %w", err)
+		return fmt.Errorf("binding to TCP address: %w", err)
 	}
 
 	errorGroup.Go(func() error { return httpServer.Serve(httpListener) })
@@ -676,30 +719,52 @@ func (h *Headscale) Serve() error {
 	log.Info().
 		Msgf("listening and serving HTTP on: %s", h.cfg.Addr)
 
-	promMux := http.NewServeMux()
-	promMux.Handle("/metrics", promhttp.Handler())
+	// Only start debug/metrics server if address is configured
+	var debugHTTPServer *http.Server
 
-	promHTTPServer := &http.Server{
-		Addr:         h.cfg.MetricsAddr,
-		Handler:      promMux,
-		ReadTimeout:  types.HTTPReadTimeout,
-		WriteTimeout: 0,
+	var debugHTTPListener net.Listener
+
+	if h.cfg.MetricsAddr != "" {
+		debugHTTPListener, err = (&net.ListenConfig{}).Listen(ctx, "tcp", h.cfg.MetricsAddr)
+		if err != nil {
+			return fmt.Errorf("binding to TCP address: %w", err)
+		}
+
+		debugHTTPServer = h.debugHTTPServer()
+
+		errorGroup.Go(func() error { return debugHTTPServer.Serve(debugHTTPListener) })
+
+		log.Info().
+			Msgf("listening and serving debug and metrics on: %s", h.cfg.MetricsAddr)
+	} else {
+		log.Info().Msg("metrics server disabled (metrics_listen_addr is empty)")
 	}
 
-	var promHTTPListener net.Listener
-	promHTTPListener, err = net.Listen("tcp", h.cfg.MetricsAddr)
+	var tailsqlCancel context.CancelFunc
 
-	if err != nil {
-		return fmt.Errorf("failed to bind to TCP address: %w", err)
+	if tailsqlEnabled {
+		if h.cfg.Database.Type != types.DatabaseSqlite {
+			//nolint:gocritic // exitAfterDefer: Fatal exits during initialization before servers start
+			log.Fatal().
+				Str("type", h.cfg.Database.Type).
+				Msgf("tailsql only support %q", types.DatabaseSqlite)
+		}
+
+		if tailsqlTSKey == "" {
+			//nolint:gocritic // exitAfterDefer: Fatal exits during initialization before servers start
+			log.Fatal().Msg("tailsql requires TS_AUTHKEY to be set")
+		}
+
+		var tailsqlCtx context.Context
+
+		tailsqlCtx, tailsqlCancel = context.WithCancel(ctx)
+
+		errorGroup.Go(func() error {
+			return runTailSQLService(tailsqlCtx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.Database.Sqlite.Path)
+		})
 	}
-
-	errorGroup.Go(func() error { return promHTTPServer.Serve(promHTTPListener) })
-
-	log.Info().
-		Msgf("listening and serving metrics on: %s", h.cfg.MetricsAddr)
 
 	// Handle common process-killing signals so we can gracefully shut down:
-	h.shutdownChan = make(chan struct{})
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc,
 		syscall.SIGHUP,
@@ -707,6 +772,7 @@ func (h *Headscale) Serve() error {
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
 		syscall.SIGHUP)
+
 	sigFunc := func(c chan os.Signal) {
 		// Wait for a SIGINT or SIGKILL:
 		for {
@@ -715,78 +781,99 @@ func (h *Headscale) Serve() error {
 			case syscall.SIGHUP:
 				log.Info().
 					Str("signal", sig.String()).
-					Msg("Received SIGHUP, reloading ACL and Config")
+					Msg("Received SIGHUP, reloading ACL policy")
 
-				// TODO(kradalby): Reload config on SIGHUP
-
-				if h.cfg.ACL.PolicyPath != "" {
-					aclPath := util.AbsolutePathFromConfigPath(h.cfg.ACL.PolicyPath)
-					pol, err := policy.LoadACLPolicyFromPath(aclPath)
-					if err != nil {
-						log.Error().Err(err).Msg("Failed to reload ACL policy")
-					}
-
-					h.ACLPolicy = pol
-					log.Info().
-						Str("path", aclPath).
-						Msg("ACL policy successfully reloaded, notifying nodes of change")
-
-					h.nodeNotifier.NotifyAll(types.StateUpdate{
-						Type: types.StateFullUpdate,
-					})
+				if h.cfg.Policy.IsEmpty() {
+					continue
 				}
 
+				changes, err := h.state.ReloadPolicy()
+				if err != nil {
+					log.Error().Err(err).Msgf("reloading policy")
+					continue
+				}
+
+				h.Change(changes...)
+
 			default:
+				info := func(msg string) { log.Info().Msg(msg) }
+
 				log.Info().
 					Str("signal", sig.String()).
 					Msg("Received signal to stop, shutting down gracefully")
 
-				close(h.shutdownChan)
-
-				h.pollNetMapStreamWG.Wait()
+				scheduleCancel()
+				h.ephemeralGC.Close()
 
 				// Gracefully shut down servers
-				ctx, cancel := context.WithTimeout(
-					context.Background(),
+				shutdownCtx, cancel := context.WithTimeout(
+					context.WithoutCancel(ctx),
 					types.HTTPShutdownTimeout,
 				)
-				if err := promHTTPServer.Shutdown(ctx); err != nil {
-					log.Error().Err(err).Msg("Failed to shutdown prometheus http")
-				}
-				if err := httpServer.Shutdown(ctx); err != nil {
-					log.Error().Err(err).Msg("Failed to shutdown http")
-				}
-				grpcSocket.GracefulStop()
+				defer cancel()
 
-				if grpcServer != nil {
-					grpcServer.GracefulStop()
-					grpcListener.Close()
+				if debugHTTPServer != nil {
+					info("shutting down debug http server")
+
+					err := debugHTTPServer.Shutdown(shutdownCtx)
+					if err != nil {
+						log.Error().Err(err).Msg("failed to shutdown prometheus http")
+					}
+				}
+
+				info("shutting down main http server")
+
+				err := httpServer.Shutdown(shutdownCtx)
+				if err != nil {
+					log.Error().Err(err).Msg("failed to shutdown http")
+				}
+
+				info("closing batcher")
+				h.mapBatcher.Close()
+
+				info("waiting for netmap stream to close")
+				h.clientStreamsOpen.Wait()
+
+				info("shutting down api server (socket)")
+
+				if err := socketServer.Shutdown(shutdownCtx); err != nil { //nolint:noinlineerr
+					log.Error().Err(err).Msg("failed to shutdown socket server")
+				}
+
+				if tailsqlCancel != nil {
+					info("shutting down tailsql")
+					tailsqlCancel()
 				}
 
 				// Close network listeners
-				promHTTPListener.Close()
+				info("closing network listeners")
+
+				if debugHTTPListener != nil {
+					debugHTTPListener.Close()
+				}
+
 				httpListener.Close()
-				grpcGatewayConn.Close()
 
 				// Stop listening (and unlink the socket if unix type):
+				info("closing socket listener")
 				socketListener.Close()
 
-				// Close db connections
-				err = h.db.Close()
+				// Close state connections
+				info("closing state and database")
+
+				err = h.state.Close()
 				if err != nil {
-					log.Error().Err(err).Msg("Failed to close db")
+					log.Error().Err(err).Msg("failed to close state")
 				}
 
 				log.Info().
 					Msg("Headscale stopped")
 
-				// And we're done:
-				cancel()
-
 				return
 			}
 		}
 	}
+
 	errorGroup.Go(func() error {
 		sigFunc(sigc)
 
@@ -797,19 +884,25 @@ func (h *Headscale) Serve() error {
 }
 
 func (h *Headscale) getTLSSettings() (*tls.Config, error) {
-	var err error
-	if h.cfg.TLS.LetsEncrypt.Hostname != "" {
-		if !strings.HasPrefix(h.cfg.ServerURL, "https://") {
-			log.Warn().
-				Msg("Listening with TLS but ServerURL does not start with https://")
-		}
+	tlsEnabled := h.cfg.TLS.LetsEncrypt.Hostname != "" || h.cfg.TLS.CertPath != ""
+	if tlsEnabled && !strings.HasPrefix(h.cfg.ServerURL, "https://") {
+		log.Warn().Msg("listening with TLS but ServerURL does not start with https://")
+	} else if !tlsEnabled && !strings.HasPrefix(h.cfg.ServerURL, "http://") {
+		log.Warn().Msg("listening without TLS but ServerURL does not start with http://")
+	}
 
+	if h.cfg.TLS.LetsEncrypt.Hostname != "" {
 		certManager := autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(h.cfg.TLS.LetsEncrypt.Hostname),
 			Cache:      autocert.DirCache(h.cfg.TLS.LetsEncrypt.CacheDir),
 			Client: &acme.Client{
 				DirectoryURL: h.cfg.ACMEURL,
+				HTTPClient: &http.Client{
+					Transport: &acmeLogger{
+						rt: http.DefaultTransport,
+					},
+				},
 			},
 			Email: h.cfg.ACMEEmail,
 		}
@@ -825,11 +918,10 @@ func (h *Headscale) getTLSSettings() (*tls.Config, error) {
 			// Configuration via autocert with HTTP-01. This requires listening on
 			// port 80 for the certificate validation in addition to the headscale
 			// service, which can be configured to run on any other port.
-
 			server := &http.Server{
 				Addr:        h.cfg.TLS.LetsEncrypt.Listen,
 				Handler:     certManager.HTTPHandler(http.HandlerFunc(h.redirect)),
-				ReadTimeout: types.HTTPReadTimeout,
+				ReadTimeout: types.HTTPTimeout,
 			}
 
 			go func() {
@@ -845,84 +937,218 @@ func (h *Headscale) getTLSSettings() (*tls.Config, error) {
 		default:
 			return nil, errUnsupportedLetsEncryptChallengeType
 		}
-	} else if h.cfg.TLS.CertPath == "" {
-		if !strings.HasPrefix(h.cfg.ServerURL, "http://") {
-			log.Warn().Msg("Listening without TLS but ServerURL does not start with http://")
-		}
-
-		return nil, err
-	} else {
-		if !strings.HasPrefix(h.cfg.ServerURL, "https://") {
-			log.Warn().Msg("Listening with TLS but ServerURL does not start with https://")
-		}
-
-		tlsConfig := &tls.Config{
-			NextProtos:   []string{"http/1.1"},
-			Certificates: make([]tls.Certificate, 1),
-			MinVersion:   tls.VersionTLS12,
-		}
-
-		tlsConfig.Certificates[0], err = tls.LoadX509KeyPair(h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath)
-
-		return tlsConfig, err
 	}
-}
 
-func notFoundHandler(
-	writer http.ResponseWriter,
-	req *http.Request,
-) {
-	body, _ := io.ReadAll(req.Body)
+	if h.cfg.TLS.CertPath == "" {
+		return nil, nil //nolint:nilnil // intentional: no TLS config when neither LetsEncrypt nor a cert path is set
+	}
 
-	log.Trace().
-		Interface("header", req.Header).
-		Interface("proto", req.Proto).
-		Interface("url", req.URL).
-		Bytes("body", body).
-		Msg("Request did not match")
-	writer.WriteHeader(http.StatusNotFound)
+	tlsConfig := &tls.Config{
+		NextProtos:   []string{"http/1.1"},
+		Certificates: make([]tls.Certificate, 1),
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	cert, err := tls.LoadX509KeyPair(h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig.Certificates[0] = cert
+
+	return tlsConfig, nil
 }
 
 func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
+	dir := filepath.Dir(path)
+
+	err := util.EnsureDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("ensuring private key directory: %w", err)
+	}
+
 	privateKey, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		log.Info().Str("path", path).Msg("No private key file at path, creating...")
+		log.Info().Str("path", path).Msg("no private key file at path, creating...")
 
 		machineKey := key.NewMachine()
 
 		machineKeyStr, err := machineKey.MarshalText()
 		if err != nil {
 			return nil, fmt.Errorf(
-				"failed to convert private key to string for saving: %w",
+				"converting private key to string for saving: %w",
 				err,
 			)
 		}
+
 		err = os.WriteFile(path, machineKeyStr, privateKeyFileMode)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"failed to save private key to disk: %w",
+				"saving private key to disk at path %q: %w",
+				path,
 				err,
 			)
 		}
 
 		return &machineKey, nil
 	} else if err != nil {
-		return nil, fmt.Errorf("failed to read private key file: %w", err)
+		return nil, fmt.Errorf("reading private key file: %w", err)
 	}
 
 	trimmedPrivateKey := strings.TrimSpace(string(privateKey))
-	privateKeyEnsurePrefix := util.PrivateKeyEnsurePrefix(trimmedPrivateKey)
 
 	var machineKey key.MachinePrivate
-	if err = machineKey.UnmarshalText([]byte(privateKeyEnsurePrefix)); err != nil {
-		log.Info().
-			Str("path", path).
-			Msg("This might be due to a legacy (headscale pre-0.12) private key. " +
-				"If the key is in WireGuard format, delete the key and restart headscale. " +
-				"A new key will automatically be generated. All Tailscale clients will have to be restarted")
-
-		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	if err = machineKey.UnmarshalText([]byte(trimmedPrivateKey)); err != nil { //nolint:noinlineerr
+		return nil, fmt.Errorf("parsing private key: %w", err)
 	}
 
 	return &machineKey, nil
+}
+
+// Change is used to send changes to nodes.
+// All change should be enqueued here and empty will be automatically
+// ignored.
+func (h *Headscale) Change(cs ...change.Change) {
+	h.mapBatcher.AddWork(cs...)
+}
+
+// HTTPHandler returns an [http.Handler] for the [Headscale] control server.
+// The handler serves the Tailscale control protocol including the /key
+// endpoint and /ts2021 Noise upgrade path.
+func (h *Headscale) HTTPHandler() http.Handler {
+	humaMux, _ := apiv1.Handler(apiv1.Backend{
+		State:  h.state,
+		Change: h.Change,
+		Cfg:    h.cfg,
+	})
+
+	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
+		State:  h.state,
+		Change: h.Change,
+		Cfg:    h.cfg,
+	})
+
+	return h.createRouter(humaMux, humaV2Mux)
+}
+
+// NoisePublicKey returns the server's Noise protocol public key.
+func (h *Headscale) NoisePublicKey() key.MachinePublic {
+	return h.noisePrivateKey.Public()
+}
+
+// GetState returns the server's state manager for programmatic access
+// to users, nodes, policies, and other server state.
+func (h *Headscale) GetState() *state.State {
+	return h.state
+}
+
+// SetServerURLForTest updates the server URL in the configuration.
+// This is needed for test servers where the URL is not known until
+// the HTTP test server starts.
+// It panics when called outside of tests.
+func (h *Headscale) SetServerURLForTest(tb testing.TB, url string) {
+	tb.Helper()
+
+	h.cfg.ServerURL = url
+}
+
+// StartBatcherForTest initialises and starts the map response batcher.
+// It registers a cleanup function on tb to stop the batcher.
+// It panics when called outside of tests.
+func (h *Headscale) StartBatcherForTest(tb testing.TB) {
+	tb.Helper()
+
+	h.mapBatcher = mapper.NewBatcherAndMapper(h.cfg, h.state)
+	h.mapBatcher.Start()
+	tb.Cleanup(func() { h.mapBatcher.Close() })
+}
+
+// MapBatcher returns the map response batcher (for test use).
+func (h *Headscale) MapBatcher() *mapper.Batcher {
+	return h.mapBatcher
+}
+
+// StartEphemeralGCForTest starts the ephemeral node garbage collector.
+// It registers a cleanup function on tb to stop the collector.
+// It panics when called outside of tests.
+func (h *Headscale) StartEphemeralGCForTest(tb testing.TB) {
+	tb.Helper()
+
+	go h.ephemeralGC.Start()
+
+	tb.Cleanup(func() { h.ephemeralGC.Close() })
+}
+
+// Provide some middleware that can inspect the ACME/autocert https calls
+// and log when things are failing.
+type acmeLogger struct {
+	rt http.RoundTripper
+}
+
+// RoundTrip will log when ACME/autocert failures happen either when err != nil OR
+// when http status codes indicate a failure has occurred.
+func (l *acmeLogger) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := l.rt.RoundTrip(req)
+	if err != nil {
+		log.Error().Err(err).Str("url", req.URL.String()).Msg("acme request failed")
+		return nil, err
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		log.Error().Int("status_code", resp.StatusCode).Str("url", req.URL.String()).Bytes("body", body).Msg("acme request returned error")
+	}
+
+	return resp, nil
+}
+
+// [zerologRequestLogger] implements chi's [middleware.LogFormatter]
+// to route HTTP request logs through zerolog.
+type zerologRequestLogger struct{}
+
+func (z *zerologRequestLogger) NewLogEntry(
+	r *http.Request,
+) middleware.LogEntry {
+	return &zerologLogEntry{
+		method: r.Method,
+		path:   r.URL.Path,
+		proto:  r.Proto,
+		remote: r.RemoteAddr,
+	}
+}
+
+type zerologLogEntry struct {
+	method string
+	path   string
+	proto  string
+	remote string
+}
+
+func (e *zerologLogEntry) Write(
+	status, bytes int,
+	header http.Header,
+	elapsed time.Duration,
+	extra any,
+) {
+	log.Info().
+		Str("method", e.method).
+		Str("path", e.path).
+		Str("proto", e.proto).
+		Str("remote", e.remote).
+		Int("status", status).
+		Int("bytes", bytes).
+		Dur("elapsed", elapsed).
+		Msg("http request")
+}
+
+func (e *zerologLogEntry) Panic(
+	v any,
+	stack []byte,
+) {
+	log.Error().
+		Interface("panic", v).
+		Bytes("stack", stack).
+		Msg("http handler panic")
 }

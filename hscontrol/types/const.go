@@ -3,7 +3,7 @@ package types
 import "time"
 
 const (
-	HTTPReadTimeout        = 30 * time.Second
+	HTTPTimeout            = 30 * time.Second
 	HTTPShutdownTimeout    = 3 * time.Second
 	TLSALPN01ChallengeType = "TLS-ALPN-01"
 	HTTP01ChallengeType    = "HTTP-01"
@@ -11,6 +11,5 @@ const (
 	JSONLogFormat = "json"
 	TextLogFormat = "text"
 
-	KeepAliveInterval = 60 * time.Second
 	MaxHostnameLength = 255
 )
