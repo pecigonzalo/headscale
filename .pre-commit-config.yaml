@@ -1,0 +1,67 @@
+# prek/pre-commit configuration for headscale
+# See: https://prek.j178.dev/quickstart/
+# See: https://prek.j178.dev/builtin/
+
+# Global exclusions - ignore generated code (proto output and emitted OpenAPI)
+# and recorded golden fixtures.
+exclude: ^(gen|openapi)/|^hscontrol/testdata/apiv1_golden/
+
+repos:
+  # Built-in hooks from pre-commit/pre-commit-hooks
+  # prek will use fast-path optimized versions automatically
+  # See: https://prek.j178.dev/builtin/
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-xml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+
+  # Local hooks for project-specific tooling
+  - repo: local
+    hooks:
+      # One formatter for Nix and markup, built from the same treefmt module as
+      # the flake's formatting check, so the hook and the check cannot disagree.
+      # Go is absent on purpose: golangci-lint owns it, below.
+      - id: treefmt
+        name: treefmt
+        entry: nix fmt --
+        language: system
+        exclude: ^docs/
+        types_or: [javascript, jsx, ts, tsx, yaml, json, html, css, scss, sass, markdown, nix]
+
+      # mdformat for docs
+      - id: mdformat
+        name: mdformat
+        entry: mdformat
+        language: system
+        types_or: [markdown]
+        files: ^docs/
+
+      # golangci-lint for Go code quality
+      - id: golangci-lint
+        name: golangci-lint
+        entry: nix develop --command -- golangci-lint run --new-from-rev=HEAD~1 --timeout=5m --fix
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      # vendor-hash keeps flakehashes.json in sync with go.mod/go.sum.
+      - id: vendor-hash
+        name: vendor-hash
+        entry: nix develop --command -- go run ./cmd/vendorhash check
+        language: system
+        files: ^(go\.mod|go\.sum|flakehashes\.json)$
+        pass_filenames: false

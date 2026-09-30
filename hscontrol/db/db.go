@@ -2,286 +2,453 @@ package db
 
 import (
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
-	"net/netip"
-	"sync"
+	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/glebarez/sqlite"
-	"github.com/juanfont/headscale/hscontrol/notifier"
+	"github.com/go-gormigrate/gormigrate/v2"
+	"github.com/juanfont/headscale/hscontrol/db/sqliteconfig"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
+	"github.com/tailscale/squibble"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
+
+//go:embed schema.sql
+var dbSchema string
+
+func init() {
+	schema.RegisterSerializer("text", TextSerialiser{})
+}
+
+var errDatabaseNotSupported = errors.New("database type not supported")
+
+var errForeignKeyConstraintsViolated = errors.New("foreign key constraints violated")
 
 const (
-	dbVersion = "1"
-	Postgres  = "postgres"
-	Sqlite    = "sqlite3"
+	maxIdleConns   = 100
+	maxOpenConns   = 100
+	contextTimeout = 10 * time.Second
 )
-
-var (
-	errValueNotFound        = errors.New("not found")
-	errDatabaseNotSupported = errors.New("database type not supported")
-)
-
-// KV is a key-value store in a psql table. For future use...
-// TODO(kradalby): Is this used for anything?
-type KV struct {
-	Key   string
-	Value string
-}
 
 type HSDatabase struct {
-	db       *gorm.DB
-	notifier *notifier.Notifier
-
-	mu sync.RWMutex
-
-	ipAllocationMutex sync.Mutex
-
-	ipPrefixes []netip.Prefix
-	baseDomain string
+	DB  *gorm.DB
+	cfg *types.Config
 }
 
-// TODO(kradalby): assemble this struct from toptions or something typed
-// rather than arguments.
-func NewHeadscaleDatabase(
-	dbType, connectionAddr string,
-	debug bool,
-	notifier *notifier.Notifier,
-	ipPrefixes []netip.Prefix,
-	baseDomain string,
-) (*HSDatabase, error) {
-	dbConn, err := openDB(dbType, connectionAddr, debug)
+// NewHeadscaleDatabase creates a new database connection and runs migrations.
+//
+//nolint:gocyclo // migration closures inflate the count; each is linear
+func NewHeadscaleDatabase(cfg *types.Config) (*HSDatabase, error) {
+	dbConn, err := openDB(cfg.Database)
 	if err != nil {
 		return nil, err
+	}
+
+	err = checkMinimumMigration(dbConn)
+	if err != nil {
+		return nil, fmt.Errorf("version check: %w", err)
+	}
+
+	err = checkVersionUpgradePath(dbConn)
+	if err != nil {
+		return nil, fmt.Errorf("version check: %w", err)
+	}
+
+	migrations := gormigrate.New(
+		dbConn,
+		gormigrate.DefaultOptions,
+		[]*gormigrate.Migration{
+			// New migrations must be added as transactions at the end of this list.
+			// Migrations start from v0.29.0; older databases are rejected by
+			// checkMinimumMigration and must upgrade to the latest 0.29.x first.
+			//
+			// Rules:
+			// - NEVER use gorm.AutoMigrate, write the exact migration steps needed
+			// - AutoMigrate depends on the struct staying exactly the same, which it won't over time.
+			// - Never write migrations that requires foreign keys to be disabled.
+			// - ALL errors in migrations must be handled properly.
+			// Shipped in 0.29.1.
+			// TODO(kradalby): remove in 0.31, which upgrades only from 0.30.
+			{
+				// Recover user_id on untagged nodes detached by the earlier
+				// version of 202602201200-clear-tagged-node-user-id, which
+				// treated tags='null' as tagged and cleared the user. This
+				// repairs databases that already upgraded to 0.29.0; databases
+				// that took the fixed migration find nothing to repair.
+				// Recovery is best-effort: the owner is re-derived from the
+				// node's pre-auth key, so nodes registered via CLI/OIDC (no
+				// pre-auth key) cannot be recovered and must be reassigned
+				// manually.
+				// Fixes: https://github.com/juanfont/headscale/issues/3323
+				ID: "202606181200-recover-null-tags-node-user-id",
+				Migrate: func(tx *gorm.DB) error {
+					err := tx.Exec(`
+UPDATE nodes
+SET user_id = (
+	SELECT pak.user_id FROM pre_auth_keys pak WHERE pak.id = nodes.auth_key_id
+)
+WHERE user_id IS NULL
+	AND auth_key_id IS NOT NULL
+	AND (tags IS NULL OR tags = '' OR tags = '[]' OR tags = 'null');
+						`).Error
+					if err != nil {
+						return fmt.Errorf("recovering user_id on untagged nodes: %w", err)
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			// 0.30 development: columns and tables that 202609231300 reads.
+			// TODO(kradalby): remove in 0.31 with the credentials migration.
+			{
+				// Add an optional owning user to API keys so the v2 API can
+				// create user-owned (untagged) auth keys, mirroring Tailscale's
+				// "key owned by the creating identity".
+				ID: "202606191500-api-key-user-id",
+				Migrate: func(tx *gorm.DB) error {
+					if !tx.Migrator().HasColumn(&types.APIKey{}, "user_id") {
+						err := tx.Migrator().AddColumn(&types.APIKey{}, "user_id")
+						if err != nil {
+							return fmt.Errorf("adding user_id to api_keys: %w", err)
+						}
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			{
+				// Add a free-text description to pre-auth keys, set via the
+				// v2 keys API.
+				ID: "202606191501-pre-auth-key-description",
+				Migrate: func(tx *gorm.DB) error {
+					if !tx.Migrator().HasColumn(&types.PreAuthKey{}, "description") {
+						err := tx.Migrator().AddColumn(&types.PreAuthKey{}, "description")
+						if err != nil {
+							return fmt.Errorf("adding description to pre_auth_keys: %w", err)
+						}
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			{
+				// Add a revoked timestamp to pre-auth keys. The v2 API's DELETE
+				// soft-revokes a key (set revoked = now) rather than destroying
+				// it; the row is reaped later by the background collector.
+				ID: "202606201200-pre-auth-key-revoked",
+				Migrate: func(tx *gorm.DB) error {
+					if !tx.Migrator().HasColumn(&types.PreAuthKey{}, "revoked") {
+						err := tx.Migrator().AddColumn(&types.PreAuthKey{}, "revoked")
+						if err != nil {
+							return fmt.Errorf("adding revoked to pre_auth_keys: %w", err)
+						}
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			{
+				// Add the OAuth client + access token tables backing the v2 API's
+				// OAuth client-credentials flow. They mirror the api_keys /
+				// pre_auth_keys security model: a public id/prefix plus an Argon2id
+				// hash of the secret.
+				//
+				// SQLite uses explicit DDL that matches schema.sql byte-for-byte
+				// (the squibble digest is the SQLite source of truth). Postgres,
+				// which has no digest and rejects SQLite-isms like AUTOINCREMENT,
+				// uses dialect-aware AutoMigrate, mirroring InitSchema's fresh-DB
+				// table creation so an existing Postgres deployment can upgrade.
+				ID: "202606211200-oauth-clients-and-tokens",
+				Migrate: func(tx *gorm.DB) error {
+					if tx.Migrator().HasTable(&types.OAuthClient{}) &&
+						tx.Migrator().HasTable(&types.OAuthAccessToken{}) {
+						return nil
+					}
+
+					if tx.Name() != "sqlite" {
+						return tx.AutoMigrate(&types.OAuthClient{}, &types.OAuthAccessToken{})
+					}
+
+					if !tx.Migrator().HasTable(&types.OAuthClient{}) {
+						err := tx.Exec(`CREATE TABLE oauth_clients(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  client_id text,
+  secret_hash blob,
+  scopes text,
+  tags text,
+  description text,
+  user_id integer,
+  created_at datetime,
+  revoked datetime
+)`).Error
+						if err != nil {
+							return fmt.Errorf("creating oauth_clients table: %w", err)
+						}
+
+						err = tx.Exec(`CREATE UNIQUE INDEX idx_oauth_clients_client_id ON oauth_clients(client_id)`).Error
+						if err != nil {
+							return fmt.Errorf("creating oauth_clients index: %w", err)
+						}
+					}
+
+					if !tx.Migrator().HasTable(&types.OAuthAccessToken{}) {
+						err := tx.Exec(`CREATE TABLE oauth_access_tokens(
+  id integer PRIMARY KEY AUTOINCREMENT,
+  prefix text,
+  hash blob,
+  client_id text,
+  scopes text,
+  tags text,
+  expiration datetime,
+  created_at datetime
+)`).Error
+						if err != nil {
+							return fmt.Errorf("creating oauth_access_tokens table: %w", err)
+						}
+
+						err = tx.Exec(`CREATE UNIQUE INDEX idx_oauth_access_tokens_prefix ON oauth_access_tokens(prefix)`).Error
+						if err != nil {
+							return fmt.Errorf("creating oauth_access_tokens index: %w", err)
+						}
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			// Shipped in 0.29.3.
+			// TODO(kradalby): remove in 0.31, which upgrades only from 0.30.
+			{
+				// Clear stale key expiry on tagged nodes. A tagged node is
+				// owned by its tags and never expires (KB 1068), but a buggy
+				// handleLogout stamped a past expiry on it, leaving it
+				// permanently Expired and unable to re-authenticate. The
+				// buggy writer is fixed, so this only repairs rows written
+				// before the upgrade; a fixed server cannot recreate them.
+				// Match the tagged-node predicate of 0.29's
+				// clear-tagged-node-user-id migration (a nil tags slice
+				// marshals to 'null', so exclude it).
+				// Fixes: https://github.com/juanfont/headscale/issues/3371
+				ID: "202607241200-clear-tagged-node-expiry",
+				Migrate: func(tx *gorm.DB) error {
+					err := tx.Exec(`
+UPDATE nodes
+SET expiry = NULL
+WHERE tags IS NOT NULL AND tags != '[]' AND tags != '' AND tags != 'null'
+	AND expiry IS NOT NULL;
+						`).Error
+					if err != nil {
+						return fmt.Errorf("clearing expiry on tagged nodes: %w", err)
+					}
+
+					return nil
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			// 0.30: unified credentials table (InitSchema keeps ensureCredentialsTable).
+			// TODO(kradalby): remove in 0.31 with the credentials migration.
+			{
+				// Create the unified credentials table; the next migration
+				// backfills it. Explicit DDL for both dialects (no AutoMigrate).
+				ID:       "202609231200-create-credentials",
+				Migrate:  ensureCredentialsTable,
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+			{
+				// Move every credential into the unified table and drop the
+				// per-kind tables (see migrateToCredentials).
+				ID: "202609231300-migrate-to-credentials",
+				Migrate: func(tx *gorm.DB) error {
+					// Already migrated (e.g. fresh DB via InitSchema): nothing to do.
+					if !tx.Migrator().HasTable("pre_auth_keys") &&
+						!tx.Migrator().HasTable("api_keys") {
+						return nil
+					}
+
+					return tx.Transaction(migrateToCredentials)
+				},
+				Rollback: func(db *gorm.DB) error { return nil },
+			},
+		},
+	)
+
+	migrations.InitSchema(func(tx *gorm.DB) error {
+		// Credentials use the migration's explicit DDL (AutoMigrate cannot
+		// express its CHECK constraints), created before Node so the
+		// nodes.auth_key_id foreign key to credentials(id) can be created.
+		err := tx.AutoMigrate(&types.User{})
+		if err != nil {
+			return err
+		}
+
+		err = ensureCredentialsTable(tx)
+		if err != nil {
+			return err
+		}
+
+		err = tx.AutoMigrate(&types.Node{}, &types.Policy{})
+		if err != nil {
+			return err
+		}
+
+		// Drop all indexes (both GORM-created and potentially pre-existing ones)
+		// to ensure we can recreate them in the correct format
+		dropIndexes := []string{
+			`DROP INDEX IF EXISTS "idx_users_deleted_at"`,
+			`DROP INDEX IF EXISTS "idx_policies_deleted_at"`,
+			`DROP INDEX IF EXISTS "idx_provider_identifier"`,
+			`DROP INDEX IF EXISTS "idx_name_provider_identifier"`,
+			`DROP INDEX IF EXISTS "idx_name_no_provider_identifier"`,
+			`DROP INDEX IF EXISTS "idx_nodes_auth_key_id"`,
+		}
+
+		for _, dropSQL := range dropIndexes {
+			err := tx.Exec(dropSQL).Error
+			if err != nil {
+				return err
+			}
+		}
+
+		// Recreate indexes without backticks to match schema.sql format
+		indexes := []string{
+			`CREATE INDEX idx_users_deleted_at ON users(deleted_at)`,
+			`CREATE INDEX idx_policies_deleted_at ON policies(deleted_at)`,
+			`CREATE UNIQUE INDEX idx_provider_identifier ON users(provider_identifier) WHERE provider_identifier IS NOT NULL`,
+			`CREATE UNIQUE INDEX idx_name_provider_identifier ON users(name, provider_identifier)`,
+			`CREATE UNIQUE INDEX idx_name_no_provider_identifier ON users(name) WHERE provider_identifier IS NULL`,
+			`CREATE INDEX idx_nodes_auth_key_id ON nodes(auth_key_id)`,
+		}
+
+		for _, indexSQL := range indexes {
+			err := tx.Exec(indexSQL).Error
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	err = runMigrations(cfg.Database, dbConn, migrations)
+	if err != nil {
+		return nil, fmt.Errorf("migration failed: %w", err)
+	}
+
+	// Store the current version in the database after migrations succeed.
+	// Dev builds skip this to preserve the stored version for the next
+	// real versioned binary.
+	currentVersion := types.GetVersionInfo().Version
+	if !isDev(currentVersion) {
+		err = setDatabaseVersion(dbConn, currentVersion)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"storing database version: %w",
+				err,
+			)
+		}
+	}
+
+	// Validate that the schema ends up in the expected state.
+	// This is currently only done on sqlite as squibble does not
+	// support Postgres and we use our sqlite schema as our source of
+	// truth.
+	if cfg.Database.Type == types.DatabaseSqlite {
+		sqlConn, err := dbConn.DB()
+		if err != nil {
+			return nil, fmt.Errorf("getting DB from gorm: %w", err)
+		}
+
+		// or else it blocks...
+		sqlConn.SetMaxIdleConns(maxIdleConns)
+
+		sqlConn.SetMaxOpenConns(maxOpenConns)
+		defer sqlConn.SetMaxIdleConns(1)
+		defer sqlConn.SetMaxOpenConns(1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
+		defer cancel()
+
+		opts := squibble.DigestOptions{
+			IgnoreTables: []string{
+				// Litestream tables, these are inserted by
+				// litestream and not part of our schema
+				// https://litestream.io/how-it-works
+				"_litestream_lock",
+				"_litestream_seq",
+			},
+		}
+
+		if err := squibble.Validate(ctx, sqlConn, dbSchema, &opts); err != nil { //nolint:noinlineerr
+			return nil, fmt.Errorf("validating schema: %w", err)
+		}
 	}
 
 	db := HSDatabase{
-		db:       dbConn,
-		notifier: notifier,
-
-		ipPrefixes: ipPrefixes,
-		baseDomain: baseDomain,
+		DB:  dbConn,
+		cfg: cfg,
 	}
-
-	log.Debug().Msgf("database %#v", dbConn)
-
-	if dbType == Postgres {
-		dbConn.Exec(`create extension if not exists "uuid-ossp";`)
-	}
-
-	_ = dbConn.Migrator().RenameTable("namespaces", "users")
-
-	// the big rename from Machine to Node
-	_ = dbConn.Migrator().RenameTable("machines", "nodes")
-	_ = dbConn.Migrator().RenameColumn(&types.Route{}, "machine_id", "node_id")
-
-	err = dbConn.AutoMigrate(types.User{})
-	if err != nil {
-		return nil, err
-	}
-
-	_ = dbConn.Migrator().RenameColumn(&types.Node{}, "namespace_id", "user_id")
-	_ = dbConn.Migrator().RenameColumn(&types.PreAuthKey{}, "namespace_id", "user_id")
-
-	_ = dbConn.Migrator().RenameColumn(&types.Node{}, "ip_address", "ip_addresses")
-	_ = dbConn.Migrator().RenameColumn(&types.Node{}, "name", "hostname")
-
-	// GivenName is used as the primary source of DNS names, make sure
-	// the field is populated and normalized if it was not when the
-	// node was registered.
-	_ = dbConn.Migrator().RenameColumn(&types.Node{}, "nickname", "given_name")
-
-	// If the MacNodehine table has a column for registered,
-	// find all occourences of "false" and drop them. Then
-	// remove the column.
-	if dbConn.Migrator().HasColumn(&types.Node{}, "registered") {
-		log.Info().
-			Msg(`Database has legacy "registered" column in node, removing...`)
-
-		nodes := types.Nodes{}
-		if err := dbConn.Not("registered").Find(&nodes).Error; err != nil {
-			log.Error().Err(err).Msg("Error accessing db")
-		}
-
-		for _, node := range nodes {
-			log.Info().
-				Str("node", node.Hostname).
-				Str("machine_key", node.MachineKey).
-				Msg("Deleting unregistered node")
-			if err := dbConn.Delete(&types.Node{}, node.ID).Error; err != nil {
-				log.Error().
-					Err(err).
-					Str("node", node.Hostname).
-					Str("machine_key", node.MachineKey).
-					Msg("Error deleting unregistered node")
-			}
-		}
-
-		err := dbConn.Migrator().DropColumn(&types.Node{}, "registered")
-		if err != nil {
-			log.Error().Err(err).Msg("Error dropping registered column")
-		}
-	}
-
-	err = dbConn.AutoMigrate(&types.Route{})
-	if err != nil {
-		return nil, err
-	}
-
-	if dbConn.Migrator().HasColumn(&types.Node{}, "enabled_routes") {
-		log.Info().Msgf("Database has legacy enabled_routes column in node, migrating...")
-
-		type NodeAux struct {
-			ID            uint64
-			EnabledRoutes types.IPPrefixes
-		}
-
-		nodesAux := []NodeAux{}
-		err := dbConn.Table("nodes").Select("id, enabled_routes").Scan(&nodesAux).Error
-		if err != nil {
-			log.Fatal().Err(err).Msg("Error accessing db")
-		}
-		for _, node := range nodesAux {
-			for _, prefix := range node.EnabledRoutes {
-				if err != nil {
-					log.Error().
-						Err(err).
-						Str("enabled_route", prefix.String()).
-						Msg("Error parsing enabled_route")
-
-					continue
-				}
-
-				err = dbConn.Preload("Node").
-					Where("node_id = ? AND prefix = ?", node.ID, types.IPPrefix(prefix)).
-					First(&types.Route{}).
-					Error
-				if err == nil {
-					log.Info().
-						Str("enabled_route", prefix.String()).
-						Msg("Route already migrated to new table, skipping")
-
-					continue
-				}
-
-				route := types.Route{
-					NodeID:     node.ID,
-					Advertised: true,
-					Enabled:    true,
-					Prefix:     types.IPPrefix(prefix),
-				}
-				if err := dbConn.Create(&route).Error; err != nil {
-					log.Error().Err(err).Msg("Error creating route")
-				} else {
-					log.Info().
-						Uint64("node_id", route.NodeID).
-						Str("prefix", prefix.String()).
-						Msg("Route migrated")
-				}
-			}
-		}
-
-		err = dbConn.Migrator().DropColumn(&types.Node{}, "enabled_routes")
-		if err != nil {
-			log.Error().Err(err).Msg("Error dropping enabled_routes column")
-		}
-	}
-
-	err = dbConn.AutoMigrate(&types.Node{})
-	if err != nil {
-		return nil, err
-	}
-
-	if dbConn.Migrator().HasColumn(&types.Node{}, "given_name") {
-		nodes := types.Nodes{}
-		if err := dbConn.Find(&nodes).Error; err != nil {
-			log.Error().Err(err).Msg("Error accessing db")
-		}
-
-		for item, node := range nodes {
-			if node.GivenName == "" {
-				normalizedHostname, err := util.NormalizeToFQDNRulesConfigFromViper(
-					node.Hostname,
-				)
-				if err != nil {
-					log.Error().
-						Caller().
-						Str("hostname", node.Hostname).
-						Err(err).
-						Msg("Failed to normalize node hostname in DB migration")
-				}
-
-				err = db.RenameNode(nodes[item], normalizedHostname)
-				if err != nil {
-					log.Error().
-						Caller().
-						Str("hostname", node.Hostname).
-						Err(err).
-						Msg("Failed to save normalized node name in DB migration")
-				}
-			}
-		}
-	}
-
-	err = dbConn.AutoMigrate(&KV{})
-	if err != nil {
-		return nil, err
-	}
-
-	err = dbConn.AutoMigrate(&types.PreAuthKey{})
-	if err != nil {
-		return nil, err
-	}
-
-	err = dbConn.AutoMigrate(&types.PreAuthKeyACLTag{})
-	if err != nil {
-		return nil, err
-	}
-
-	_ = dbConn.Migrator().DropTable("shared_machines")
-
-	err = dbConn.AutoMigrate(&types.APIKey{})
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO(kradalby): is this needed?
-	err = db.setValue("db_version", dbVersion)
 
 	return &db, err
 }
 
-func openDB(dbType, connectionAddr string, debug bool) (*gorm.DB, error) {
-	log.Debug().Str("type", dbType).Str("connection", connectionAddr).Msg("opening database")
-
+func openDB(cfg types.DatabaseConfig) (*gorm.DB, error) {
+	// TODO(kradalby): Integrate this with zerolog
 	var dbLogger logger.Interface
-	if debug {
-		dbLogger = logger.Default
+	if cfg.Debug {
+		dbLogger = util.NewDBLogWrapper(&log.Logger, cfg.Gorm.SlowThreshold, cfg.Gorm.SkipErrRecordNotFound, cfg.Gorm.ParameterizedQueries)
 	} else {
 		dbLogger = logger.Default.LogMode(logger.Silent)
 	}
 
-	switch dbType {
-	case Sqlite:
+	switch cfg.Type {
+	case types.DatabaseSqlite:
+		dir := filepath.Dir(cfg.Sqlite.Path)
+
+		err := util.EnsureDir(dir)
+		if err != nil {
+			return nil, fmt.Errorf("creating directory for sqlite: %w", err)
+		}
+
+		log.Info().
+			Str("database", types.DatabaseSqlite).
+			Str("path", cfg.Sqlite.Path).
+			Msg("Opening database")
+
+		// Build SQLite configuration with pragmas set at connection time
+		sqliteConfig := sqliteconfig.Default(cfg.Sqlite.Path)
+		if cfg.Sqlite.WriteAheadLog {
+			sqliteConfig.JournalMode = sqliteconfig.JournalModeWAL
+			sqliteConfig.WALAutocheckpoint = cfg.Sqlite.WALAutoCheckPoint
+		}
+
+		connectionURL, err := sqliteConfig.ToURL()
+		if err != nil {
+			return nil, fmt.Errorf("building sqlite connection URL: %w", err)
+		}
+
 		db, err := gorm.Open(
-			sqlite.Open(connectionAddr+"?_synchronous=1&_journal_mode=WAL"),
+			sqlite.Open(connectionURL),
 			&gorm.Config{
-				DisableForeignKeyConstraintWhenMigrating: true,
-				Logger:                                   dbLogger,
+				PrepareStmt: cfg.Gorm.PrepareStmt,
+				Logger:      dbLogger,
 			},
 		)
 
-		db.Exec("PRAGMA foreign_keys=ON")
-
 		// The pure Go SQLite library does not handle locking in
-		// the same way as the C based one and we cant use the gorm
+		// the same way as the C based one and we can't use the gorm
 		// connection pool as of 2022/02/23.
 		sqlDB, _ := db.DB()
 		sqlDB.SetMaxIdleConns(1)
@@ -290,48 +457,113 @@ func openDB(dbType, connectionAddr string, debug bool) (*gorm.DB, error) {
 
 		return db, err
 
-	case Postgres:
-		return gorm.Open(postgres.Open(connectionAddr), &gorm.Config{
-			DisableForeignKeyConstraintWhenMigrating: true,
-			Logger:                                   dbLogger,
+	case types.DatabasePostgres:
+		dbString := fmt.Sprintf(
+			"host=%s dbname=%s user=%s",
+			cfg.Postgres.Host,
+			cfg.Postgres.Name,
+			cfg.Postgres.User,
+		)
+
+		log.Info().
+			Str("database", types.DatabasePostgres).
+			Str("path", dbString).
+			Msg("Opening database")
+
+		if sslEnabled, err := strconv.ParseBool(cfg.Postgres.Ssl); err == nil { //nolint:noinlineerr
+			if !sslEnabled {
+				dbString += " sslmode=disable"
+			}
+		} else {
+			dbString += " sslmode=" + cfg.Postgres.Ssl
+		}
+
+		if cfg.Postgres.Port != 0 {
+			dbString += fmt.Sprintf(" port=%d", cfg.Postgres.Port)
+		}
+
+		if cfg.Postgres.Pass != "" {
+			dbString += " password=" + cfg.Postgres.Pass
+		}
+
+		db, err := gorm.Open(postgres.Open(dbString), &gorm.Config{
+			Logger: dbLogger,
 		})
+		if err != nil {
+			return nil, err
+		}
+
+		sqlDB, _ := db.DB()
+		sqlDB.SetMaxIdleConns(cfg.Postgres.MaxIdleConnections)
+		sqlDB.SetMaxOpenConns(cfg.Postgres.MaxOpenConnections)
+		sqlDB.SetConnMaxIdleTime(
+			time.Duration(cfg.Postgres.ConnMaxIdleTimeSecs) * time.Second,
+		)
+
+		return db, nil
 	}
 
 	return nil, fmt.Errorf(
 		"database of type %s is not supported: %w",
-		dbType,
+		cfg.Type,
 		errDatabaseNotSupported,
 	)
 }
 
-// getValue returns the value for the given key in KV.
-func (hsdb *HSDatabase) getValue(key string) (string, error) {
-	var row KV
-	if result := hsdb.db.First(&row, "key = ?", key); errors.Is(
-		result.Error,
-		gorm.ErrRecordNotFound,
-	) {
-		return "", errValueNotFound
-	}
+func runMigrations(cfg types.DatabaseConfig, dbConn *gorm.DB, migrations *gormigrate.Gormigrate) error {
+	if cfg.Type == types.DatabaseSqlite {
+		if err := migrations.Migrate(); err != nil { //nolint:noinlineerr
+			return err
+		}
 
-	return row.Value, nil
-}
+		// Check for constraint violations at the end
+		type constraintViolation struct {
+			Table           string
+			RowID           int
+			Parent          string
+			ConstraintIndex int
+		}
 
-// setValue sets value for the given key in KV.
-func (hsdb *HSDatabase) setValue(key string, value string) error {
-	keyValue := KV{
-		Key:   key,
-		Value: value,
-	}
+		var violatedConstraints []constraintViolation
 
-	if _, err := hsdb.getValue(key); err == nil {
-		hsdb.db.Model(&keyValue).Where("key = ?", key).Update("value", value)
+		rows, err := dbConn.Raw("PRAGMA foreign_key_check").Rows()
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
 
-		return nil
-	}
+		for rows.Next() {
+			var violation constraintViolation
 
-	if err := hsdb.db.Create(keyValue).Error; err != nil {
-		return fmt.Errorf("failed to create key value pair in the database: %w", err)
+			err := rows.Scan(&violation.Table, &violation.RowID, &violation.Parent, &violation.ConstraintIndex)
+			if err != nil {
+				return err
+			}
+
+			violatedConstraints = append(violatedConstraints, violation)
+		}
+
+		if err := rows.Err(); err != nil { //nolint:noinlineerr
+			return err
+		}
+
+		if len(violatedConstraints) > 0 {
+			for _, violation := range violatedConstraints {
+				log.Error().
+					Str("table", violation.Table).
+					Int("row_id", violation.RowID).
+					Str("parent", violation.Parent).
+					Msg("Foreign key constraint violated")
+			}
+
+			return errForeignKeyConstraintsViolated
+		}
+	} else {
+		// PostgreSQL can run all migrations in one block - no foreign key issues
+		err := migrations.Migrate()
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -340,7 +572,8 @@ func (hsdb *HSDatabase) setValue(key string, value string) error {
 func (hsdb *HSDatabase) PingDB(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	sqlDB, err := hsdb.db.DB()
+
+	sqlDB, err := hsdb.DB.DB()
 	if err != nil {
 		return err
 	}
@@ -349,10 +582,59 @@ func (hsdb *HSDatabase) PingDB(ctx context.Context) error {
 }
 
 func (hsdb *HSDatabase) Close() error {
-	db, err := hsdb.db.DB()
+	db, err := hsdb.DB.DB()
 	if err != nil {
 		return err
 	}
 
+	if hsdb.cfg.Database.Type == types.DatabaseSqlite && hsdb.cfg.Database.Sqlite.WriteAheadLog {
+		db.Exec("VACUUM") //nolint:errcheck,noctx
+	}
+
 	return db.Close()
+}
+
+func (hsdb *HSDatabase) Read(fn func(rx *gorm.DB) error) error {
+	rx := hsdb.DB.Begin()
+	defer rx.Rollback()
+
+	return fn(rx)
+}
+
+func Read[T any](db *gorm.DB, fn func(rx *gorm.DB) (T, error)) (T, error) {
+	rx := db.Begin()
+	defer rx.Rollback()
+
+	ret, err := fn(rx)
+	if err != nil {
+		var no T
+		return no, err
+	}
+
+	return ret, nil
+}
+
+func (hsdb *HSDatabase) Write(fn func(tx *gorm.DB) error) error {
+	tx := hsdb.DB.Begin()
+	defer tx.Rollback()
+
+	err := fn(tx)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit().Error
+}
+
+func Write[T any](db *gorm.DB, fn func(tx *gorm.DB) (T, error)) (T, error) {
+	tx := db.Begin()
+	defer tx.Rollback()
+
+	ret, err := fn(tx)
+	if err != nil {
+		var no T
+		return no, err
+	}
+
+	return ret, tx.Commit().Error
 }

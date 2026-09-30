@@ -1,43 +1,38 @@
 package db
 
 import (
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"gorm.io/gorm"
+	"tailscale.com/util/set"
 )
 
 var (
-	ErrPreAuthKeyNotFound          = errors.New("AuthKey not found")
-	ErrPreAuthKeyExpired           = errors.New("AuthKey expired")
-	ErrSingleUseAuthKeyHasBeenUsed = errors.New("AuthKey has already been used")
+	// ErrPreAuthKeyNotFound wraps gorm.ErrRecordNotFound so an unknown or
+	// deleted key is treated as a missing record by callers, which the
+	// registration handler maps to a 401 rather than a raw server error.
+	ErrPreAuthKeyNotFound          = fmt.Errorf("auth-key not found: %w", gorm.ErrRecordNotFound)
+	ErrPreAuthKeyExpired           = errors.New("auth-key expired")
+	ErrSingleUseAuthKeyHasBeenUsed = errors.New("auth-key has already been used")
 	ErrUserMismatch                = errors.New("user mismatch")
-	ErrPreAuthKeyACLTagInvalid     = errors.New("AuthKey tag is invalid")
+	ErrPreAuthKeyACLTagInvalid     = errors.New("auth-key tag is invalid")
 )
 
-// CreatePreAuthKey creates a new PreAuthKey in a user, and returns it.
-func (hsdb *HSDatabase) CreatePreAuthKey(
-	userName string,
-	reusable bool,
-	ephemeral bool,
-	expiration *time.Time,
-	aclTags []string,
-) (*types.PreAuthKey, error) {
-	// TODO(kradalby): figure out this lock
-	// hsdb.mu.Lock()
-	// defer hsdb.mu.Unlock()
+// validateACLTags deduplicates, sorts, and checks that every tag carries the
+// "tag:" prefix. Shared by the pre-auth-key and OAuth credential paths so both
+// enforce the same tag shape.
+func validateACLTags(tags []string) ([]string, error) {
+	tags = set.SetOf(tags).Slice()
+	slices.Sort(tags)
 
-	user, err := hsdb.GetUser(userName)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, tag := range aclTags {
+	for _, tag := range tags {
 		if !strings.HasPrefix(tag, "tag:") {
 			return nil, fmt.Errorf(
 				"%w: '%s' did not begin with 'tag:'",
@@ -47,183 +42,441 @@ func (hsdb *HSDatabase) CreatePreAuthKey(
 		}
 	}
 
-	now := time.Now().UTC()
-	kstr, err := hsdb.generateKey()
+	return tags, nil
+}
+
+func (hsdb *HSDatabase) CreatePreAuthKey(
+	uid *types.UserID,
+	reusable bool,
+	ephemeral bool,
+	expiration *time.Time,
+	aclTags []string,
+) (*types.PreAuthKeyNew, error) {
+	return Write(hsdb.DB, func(tx *gorm.DB) (*types.PreAuthKeyNew, error) {
+		return CreatePreAuthKey(tx, uid, reusable, ephemeral, expiration, aclTags)
+	})
+}
+
+const authKeyPrefix = "hskey-auth-"
+
+// CreatePreAuthKey creates a new [types.PreAuthKey] in a user, and returns it.
+// The uid parameter can be nil for system-created tagged keys.
+// For tagged keys, uid tracks "created by" (who created the key).
+// For user-owned keys, uid tracks the node owner.
+func CreatePreAuthKey(
+	tx *gorm.DB,
+	uid *types.UserID,
+	reusable bool,
+	ephemeral bool,
+	expiration *time.Time,
+	aclTags []string,
+) (*types.PreAuthKeyNew, error) {
+	// Validate: must be tagged OR user-owned, not neither
+	if uid == nil && len(aclTags) == 0 {
+		return nil, ErrPreAuthKeyNotTaggedOrOwned
+	}
+
+	var (
+		user   *types.User
+		userID *uint
+	)
+
+	if uid != nil {
+		var err error
+
+		user, err = GetUserByID(tx, *uid)
+		if err != nil {
+			return nil, err
+		}
+
+		userID = &user.ID
+	}
+
+	aclTags, err := validateACLTags(aclTags)
 	if err != nil {
 		return nil, err
 	}
 
-	key := types.PreAuthKey{
-		Key:        kstr,
-		UserID:     user.ID,
-		User:       *user,
+	now := time.Now().UTC()
+
+	keyStr, identifier, hash := generateSecret(authKeyPrefix)
+
+	// Set only UserID for the write so GORM does not upsert the User row; the
+	// User is attached afterwards for the returned projection.
+	cred := types.Credential{
+		Kind:       types.CredentialPreAuthKey,
+		Identifier: identifier,
+		Hash:       hash,
+		UserID:     userID, // nil for system-created keys, or "created by" for tagged keys
 		Reusable:   reusable,
 		Ephemeral:  ephemeral,
 		CreatedAt:  &now,
 		Expiration: expiration,
+		Tags:       aclTags, // empty for user-owned keys
 	}
 
-	err = hsdb.db.Transaction(func(db *gorm.DB) error {
-		if err := db.Save(&key).Error; err != nil {
-			return fmt.Errorf("failed to create key in the database: %w", err)
-		}
+	if err := tx.Save(&cred).Error; err != nil { //nolint:noinlineerr
+		return nil, fmt.Errorf("creating key in database: %w", err)
+	}
 
-		if len(aclTags) > 0 {
-			seenTags := map[string]bool{}
+	return &types.PreAuthKeyNew{
+		ID:         cred.ID,
+		Key:        keyStr,
+		Reusable:   cred.Reusable,
+		Ephemeral:  cred.Ephemeral,
+		Tags:       cred.Tags,
+		Expiration: cred.Expiration,
+		CreatedAt:  cred.CreatedAt,
+		User:       user, // nil for system-created keys
+	}, nil
+}
 
-			for _, tag := range aclTags {
-				if !seenTags[tag] {
-					if err := db.Save(&types.PreAuthKeyACLTag{PreAuthKeyID: key.ID, Tag: tag}).Error; err != nil {
-						return fmt.Errorf(
-							"failed to ceate key tag in the database: %w",
-							err,
-						)
-					}
-					seenTags[tag] = true
-				}
-			}
-		}
+// SetPreAuthKeyDescription sets the free-text description on a pre-auth key.
+// The v2 keys API sets it after creation rather than threading it through the
+// many-armed CreatePreAuthKey signature shared by every other caller.
+func (hsdb *HSDatabase) SetPreAuthKeyDescription(id uint64, description string) error {
+	res := hsdb.DB.Model(&types.Credential{}).
+		Where("kind = ? AND id = ?", types.CredentialPreAuthKey, id).
+		Update("description", description)
+	if res.Error != nil {
+		return res.Error
+	}
 
-		return nil
-	})
+	if res.RowsAffected == 0 {
+		return ErrPreAuthKeyNotFound
+	}
 
+	return nil
+}
+
+func (hsdb *HSDatabase) ListPreAuthKeys() ([]types.PreAuthKey, error) {
+	return Read(hsdb.DB, ListPreAuthKeys)
+}
+
+// ListPreAuthKeys returns all [types.PreAuthKey] values in the database.
+func ListPreAuthKeys(tx *gorm.DB) ([]types.PreAuthKey, error) {
+	var creds []types.Credential
+
+	err := tx.Preload("User").
+		Where("kind = ?", types.CredentialPreAuthKey).
+		Find(&creds).Error
 	if err != nil {
 		return nil, err
 	}
 
-	return &key, nil
-}
-
-// ListPreAuthKeys returns the list of PreAuthKeys for a user.
-func (hsdb *HSDatabase) ListPreAuthKeys(userName string) ([]types.PreAuthKey, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.listPreAuthKeys(userName)
-}
-
-func (hsdb *HSDatabase) listPreAuthKeys(userName string) ([]types.PreAuthKey, error) {
-	user, err := hsdb.getUser(userName)
-	if err != nil {
-		return nil, err
-	}
-
-	keys := []types.PreAuthKey{}
-	if err := hsdb.db.Preload("User").Preload("ACLTags").Where(&types.PreAuthKey{UserID: user.ID}).Find(&keys).Error; err != nil {
-		return nil, err
+	keys := make([]types.PreAuthKey, 0, len(creds))
+	for i := range creds {
+		keys = append(keys, *credentialToPreAuthKey(&creds[i]))
 	}
 
 	return keys, nil
 }
 
-// GetPreAuthKey returns a PreAuthKey for a given key.
-func (hsdb *HSDatabase) GetPreAuthKey(user string, key string) (*types.PreAuthKey, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
+// ListPreAuthKeysByUser returns all [types.PreAuthKey] values belonging to a specific user.
+func ListPreAuthKeysByUser(tx *gorm.DB, uid types.UserID) ([]types.PreAuthKey, error) {
+	var creds []types.Credential
 
-	pak, err := hsdb.ValidatePreAuthKey(key)
+	err := tx.Preload("User").
+		Where("kind = ? AND user_id = ?", types.CredentialPreAuthKey, uint(uid)).
+		Find(&creds).Error
 	if err != nil {
 		return nil, err
 	}
 
-	if pak.User.Name != user {
-		return nil, ErrUserMismatch
+	keys := make([]types.PreAuthKey, 0, len(creds))
+	for i := range creds {
+		keys = append(keys, *credentialToPreAuthKey(&creds[i]))
 	}
 
-	return pak, nil
+	return keys, nil
 }
 
-// DestroyPreAuthKey destroys a preauthkey. Returns error if the PreAuthKey
-// does not exist.
-func (hsdb *HSDatabase) DestroyPreAuthKey(pak types.PreAuthKey) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+var (
+	ErrPreAuthKeyFailedToParse    = errors.New("failed to parse auth-key")
+	ErrPreAuthKeyNotTaggedOrOwned = errors.New("auth-key must be either tagged or owned by user")
+)
 
-	return hsdb.destroyPreAuthKey(pak)
+func findAuthKey(tx *gorm.DB, keyStr string) (*types.PreAuthKey, error) {
+	// Validate input is not empty
+	if keyStr == "" {
+		return nil, ErrPreAuthKeyFailedToParse
+	}
+
+	// Unprefixed: a migrated pre-0.28 plaintext key.
+	// TODO(kradalby): remove in 0.32 with legacy key formats (announced).
+	identifier, secret := legacyAuthKeyIdentifier(keyStr), keyStr
+
+	_, prefixAndSecret, found := strings.Cut(keyStr, authKeyPrefix)
+	if found {
+		var err error
+
+		identifier, secret, err = parsePrefixedKey(prefixAndSecret, ErrPreAuthKeyFailedToParse)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	cred, err := authenticateCredential(
+		tx, types.CredentialPreAuthKey, identifier, secret, ErrPreAuthKeyNotFound, "User",
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return credentialToPreAuthKey(cred), nil
 }
 
-func (hsdb *HSDatabase) destroyPreAuthKey(pak types.PreAuthKey) error {
-	return hsdb.db.Transaction(func(db *gorm.DB) error {
-		if result := db.Unscoped().Where(types.PreAuthKeyACLTag{PreAuthKeyID: pak.ID}).Delete(&types.PreAuthKeyACLTag{}); result.Error != nil {
-			return result.Error
+// legacyAuthKeyIdentifier derives the lookup identifier of a pre-0.28 plaintext
+// pre-auth key, which has no embedded identifier. The migration stores these
+// keys under it with the whole key hashed as the secret; the "legacy-" prefix
+// keeps it disjoint from the hex identifiers of current keys.
+//
+// TODO(kradalby): remove in 0.32 with legacy key formats (announced).
+func legacyAuthKeyIdentifier(key string) string {
+	sum := sha256.Sum256([]byte(key))
+
+	return "legacy-" + hex.EncodeToString(sum[:])[:keyIdentifierLength]
+}
+
+// parsePrefixedKey splits the prefix-and-secret portion of a new-format key
+// (the part after the "hskey-*-" prefix) into its fixed-length prefix and
+// secret components, validating the length, separator position, and that both
+// components are base64 URL-safe. Fixed-length parsing is used instead of
+// separator-based to handle dashes in base64 URL-safe characters.
+func parsePrefixedKey(prefixAndSecret string, parseErr error) (string, string, error) {
+	const (
+		prefixLen = keyIdentifierLength
+		secretLen = keySecretLength
+	)
+
+	expectedMinLength := prefixLen + 1 + secretLen
+	if len(prefixAndSecret) < expectedMinLength {
+		return "", "", fmt.Errorf(
+			"%w: key too short, expected at least %d chars after prefix, got %d",
+			parseErr,
+			expectedMinLength,
+			len(prefixAndSecret),
+		)
+	}
+
+	prefix := prefixAndSecret[:prefixLen]
+
+	// Validate separator at expected position
+	if prefixAndSecret[prefixLen] != '-' {
+		return "", "", fmt.Errorf(
+			"%w: expected separator '-' at position %d, got '%c'",
+			parseErr,
+			prefixLen,
+			prefixAndSecret[prefixLen],
+		)
+	}
+
+	secret := prefixAndSecret[prefixLen+1:]
+
+	// Validate secret length
+	if len(secret) != secretLen {
+		return "", "", fmt.Errorf(
+			"%w: secret length mismatch, expected %d chars, got %d",
+			parseErr,
+			secretLen,
+			len(secret),
+		)
+	}
+
+	// Validate prefix contains only base64 URL-safe characters
+	if !isValidBase64URLSafe(prefix) {
+		return "", "", fmt.Errorf(
+			"%w: prefix contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
+			parseErr,
+		)
+	}
+
+	// Validate secret contains only base64 URL-safe characters
+	if !isValidBase64URLSafe(secret) {
+		return "", "", fmt.Errorf(
+			"%w: secret contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
+			parseErr,
+		)
+	}
+
+	return prefix, secret, nil
+}
+
+// isValidBase64URLSafe reports whether s contains only base64 URL-safe
+// characters (A-Za-z0-9-_): current keys are hex, older ones used the wider
+// base64url alphabet.
+//
+// TODO(kradalby): accept hex only in 0.32, with legacy key formats.
+func isValidBase64URLSafe(s string) bool {
+	return !strings.ContainsFunc(s, func(c rune) bool {
+		return (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_'
+	})
+}
+
+func (hsdb *HSDatabase) GetPreAuthKey(key string) (*types.PreAuthKey, error) {
+	return GetPreAuthKey(hsdb.DB, key)
+}
+
+// GetPreAuthKey returns a [types.PreAuthKey] for a given key. The caller is responsible
+// for checking if the key is usable (expired or used).
+func GetPreAuthKey(tx *gorm.DB, key string) (*types.PreAuthKey, error) {
+	return findAuthKey(tx, key)
+}
+
+// GetPreAuthKeyByID returns a [types.PreAuthKey] by its primary key, with the
+// owning user preloaded.
+func (hsdb *HSDatabase) GetPreAuthKeyByID(id uint64) (*types.PreAuthKey, error) {
+	var cred types.Credential
+	// Explicit primary-key clause: a struct condition would drop a zero-valued
+	// ID, making the lookup unconditional and returning the first row instead
+	// of not-found.
+	if result := hsdb.DB.Preload("User").
+		First(&cred, "kind = ? AND id = ?", types.CredentialPreAuthKey, id); result.Error != nil {
+		return nil, result.Error
+	}
+
+	return credentialToPreAuthKey(&cred), nil
+}
+
+// DestroyPreAuthKey destroys a preauthkey. Returns error if the [types.PreAuthKey]
+// does not exist. This also clears the auth_key_id on any nodes that reference
+// this key.
+func DestroyPreAuthKey(tx *gorm.DB, id uint64) error {
+	return tx.Transaction(func(db *gorm.DB) error {
+		// First, clear the foreign key reference on any nodes using this key
+		err := db.Model(&types.Node{}).
+			Where("auth_key_id = ?", id).
+			Update("auth_key_id", nil).Error
+		if err != nil {
+			return fmt.Errorf("clearing auth_key_id on nodes: %w", err)
 		}
 
-		if result := db.Unscoped().Delete(pak); result.Error != nil {
-			return result.Error
+		// Then delete the pre-auth key, on the same savepoint as the
+		// node update so both roll back together.
+		res := db.Unscoped().
+			Delete(&types.Credential{}, "kind = ? AND id = ?", types.CredentialPreAuthKey, id)
+		if res.Error != nil {
+			return res.Error
+		}
+
+		if res.RowsAffected == 0 {
+			return ErrPreAuthKeyNotFound
 		}
 
 		return nil
 	})
 }
 
-// MarkExpirePreAuthKey marks a PreAuthKey as expired.
-func (hsdb *HSDatabase) ExpirePreAuthKey(k *types.PreAuthKey) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+func (hsdb *HSDatabase) ExpirePreAuthKey(id uint64) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return ExpirePreAuthKey(tx, id)
+	})
+}
 
-	if err := hsdb.db.Model(&k).Update("Expiration", time.Now()).Error; err != nil {
-		return err
+func (hsdb *HSDatabase) DeletePreAuthKey(id uint64) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return DestroyPreAuthKey(tx, id)
+	})
+}
+
+func (hsdb *HSDatabase) RevokePreAuthKey(id uint64) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return RevokePreAuthKey(tx, id)
+	})
+}
+
+// RevokePreAuthKey soft-revokes a key (the v2 API's DELETE): the row is kept and
+// stays retrievable with its invalid flag set, but the key can no longer
+// authorize nodes. The background collector hard-deletes it after the retention
+// window. An already-revoked or unknown id returns [ErrPreAuthKeyNotFound], so a
+// repeated DELETE is a clean 404.
+func RevokePreAuthKey(tx *gorm.DB, id uint64) error {
+	res := tx.Model(&types.Credential{}).
+		Where("kind = ? AND id = ? AND revoked IS NULL", types.CredentialPreAuthKey, id).
+		Update("revoked", time.Now())
+	if res.Error != nil {
+		return res.Error
+	}
+
+	if res.RowsAffected == 0 {
+		return ErrPreAuthKeyNotFound
 	}
 
 	return nil
 }
 
-// UsePreAuthKey marks a PreAuthKey as used.
-func (hsdb *HSDatabase) UsePreAuthKey(k *types.PreAuthKey) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+// DestroyRevokedPreAuthKeysBefore hard-deletes every key revoked before cutoff,
+// returning how many were removed. The background collector calls this to reap
+// soft-revoked keys after the retention window. Keys still referenced by a node
+// are kept: the node's ephemerality lives on its key, and revoking a key must
+// not change nodes already registered with it.
+func (hsdb *HSDatabase) DestroyRevokedPreAuthKeysBefore(cutoff time.Time) (int, error) {
+	var count int
+
+	err := hsdb.Write(func(tx *gorm.DB) error {
+		var ids []uint64
+
+		err := tx.Model(&types.Credential{}).
+			Where("kind = ? AND revoked IS NOT NULL AND revoked < ?", types.CredentialPreAuthKey, cutoff).
+			Where("id NOT IN (SELECT auth_key_id FROM nodes WHERE auth_key_id IS NOT NULL)").
+			Pluck("id", &ids).Error
+		if err != nil {
+			return err
+		}
+
+		for _, id := range ids {
+			err := DestroyPreAuthKey(tx, id)
+			if err != nil {
+				return err
+			}
+		}
+
+		count = len(ids)
+
+		return nil
+	})
+
+	return count, err
+}
+
+// UsePreAuthKey atomically marks a [types.PreAuthKey] as used. The UPDATE is
+// guarded by `used = false` so two concurrent registrations racing for
+// the same single-use key cannot both succeed: the first commits and
+// the second returns [types.PAKError]("authkey already used"). Without the
+// guard the previous code (Update("used", true) with no WHERE) would
+// silently let both transactions claim the key.
+func UsePreAuthKey(tx *gorm.DB, k *types.PreAuthKey) error {
+	res := tx.Model(&types.Credential{}).
+		Where("kind = ? AND id = ? AND used = ?", types.CredentialPreAuthKey, k.ID, false).
+		Update("used", true)
+	if res.Error != nil {
+		return fmt.Errorf("updating key used status in database: %w", res.Error)
+	}
+
+	if res.RowsAffected == 0 {
+		return types.PAKError("authkey already used")
+	}
 
 	k.Used = true
-	if err := hsdb.db.Save(k).Error; err != nil {
-		return fmt.Errorf("failed to update key used status in the database: %w", err)
-	}
 
 	return nil
 }
 
-// ValidatePreAuthKey does the heavy lifting for validation of the PreAuthKey coming from a node
-// If returns no error and a PreAuthKey, it can be used.
-func (hsdb *HSDatabase) ValidatePreAuthKey(k string) (*types.PreAuthKey, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
+// ExpirePreAuthKey marks a [types.PreAuthKey] as expired, returning
+// [ErrPreAuthKeyNotFound] rather than succeeding silently when no such key exists.
+func ExpirePreAuthKey(tx *gorm.DB, id uint64) error {
+	now := time.Now()
 
-	pak := types.PreAuthKey{}
-	if result := hsdb.db.Preload("User").Preload("ACLTags").First(&pak, "key = ?", k); errors.Is(
-		result.Error,
-		gorm.ErrRecordNotFound,
-	) {
-		return nil, ErrPreAuthKeyNotFound
+	res := tx.Model(&types.Credential{}).
+		Where("kind = ? AND id = ?", types.CredentialPreAuthKey, id).
+		Update("expiration", now)
+	if res.Error != nil {
+		return res.Error
 	}
 
-	if pak.Expiration != nil && pak.Expiration.Before(time.Now()) {
-		return nil, ErrPreAuthKeyExpired
+	if res.RowsAffected == 0 {
+		return ErrPreAuthKeyNotFound
 	}
 
-	if pak.Reusable || pak.Ephemeral { // we don't need to check if has been used before
-		return &pak, nil
-	}
-
-	nodes := types.Nodes{}
-	if err := hsdb.db.
-		Preload("AuthKey").
-		Where(&types.Node{AuthKeyID: uint(pak.ID)}).
-		Find(&nodes).Error; err != nil {
-		return nil, err
-	}
-
-	if len(nodes) != 0 || pak.Used {
-		return nil, ErrSingleUseAuthKeyHasBeenUsed
-	}
-
-	return &pak, nil
-}
-
-func (hsdb *HSDatabase) generateKey() (string, error) {
-	size := 24
-	bytes := make([]byte, size)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(bytes), nil
+	return nil
 }

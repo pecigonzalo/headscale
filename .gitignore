@@ -1,5 +1,10 @@
 ignored/
 tailscale/
+.vscode/
+.claude/
+logs/
+
+*.prof
 
 # Binaries for programs and plugins
 *.exe
@@ -19,10 +24,12 @@ vendor/
 
 dist/
 /headscale
-config.json
 config.yaml
+config*.yaml
+!config-example.yaml
 derp.yaml
 *.hujson
+!hscontrol/policy/v2/testdata/*/*.hujson
 *.key
 /db.sqlite
 *.sqlite3
@@ -39,8 +46,15 @@ result
 
 integration_test/etc/config.dump.yaml
 
+# OpenAPI spec is served live from the code and emitted on demand, not committed
+/openapi/v1/headscale.yaml
+
 # MkDocs
 .cache
 /site
 
 __debug_bin
+
+node_modules/
+package-lock.json
+package.json
