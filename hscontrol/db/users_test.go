@@ -1,129 +1,343 @@
 package db
 
 import (
+	"fmt"
+	"testing"
+
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
 
-func (s *Suite) TestCreateAndDestroyUser(c *check.C) {
-	user, err := db.CreateUser("test")
-	c.Assert(err, check.IsNil)
-	c.Assert(user.Name, check.Equals, "test")
+func TestCreateAndDestroyUser(t *testing.T) {
+	db, err := newSQLiteTestDB()
+	require.NoError(t, err)
 
-	users, err := db.ListUsers()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(users), check.Equals, 1)
+	user := db.CreateUserForTest("test")
+	assert.Equal(t, "test", user.Name)
 
-	err = db.DestroyUser("test")
-	c.Assert(err, check.IsNil)
+	users, err := db.ListUsers(nil)
+	require.NoError(t, err)
+	assert.Len(t, users, 1)
 
-	_, err = db.GetUser("test")
-	c.Assert(err, check.NotNil)
+	err = db.DestroyUser(types.UserID(user.ID))
+	require.NoError(t, err)
+
+	_, err = db.GetUserByID(types.UserID(user.ID))
+	assert.Error(t, err)
 }
 
-func (s *Suite) TestDestroyUserErrors(c *check.C) {
-	err := db.DestroyUser("test")
-	c.Assert(err, check.Equals, ErrUserNotFound)
+func TestDestroyUserErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		test func(*testing.T, *HSDatabase)
+	}{
+		{
+			name: "error_user_not_found",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
 
-	user, err := db.CreateUser("test")
-	c.Assert(err, check.IsNil)
+				err := db.DestroyUser(9998)
+				assert.ErrorIs(t, err, ErrUserNotFound)
+			},
+		},
+		{
+			name: "success_deletes_preauthkeys",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
 
-	pak, err := db.CreatePreAuthKey(user.Name, false, false, nil, nil)
-	c.Assert(err, check.IsNil)
+				user := db.CreateUserForTest("test")
 
-	err = db.DestroyUser("test")
-	c.Assert(err, check.IsNil)
+				pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+				require.NoError(t, err)
 
-	result := db.db.Preload("User").First(&pak, "key = ?", pak.Key)
-	// destroying a user also deletes all associated preauthkeys
-	c.Assert(result.Error, check.Equals, gorm.ErrRecordNotFound)
+				err = db.DestroyUser(types.UserID(user.ID))
+				require.NoError(t, err)
 
-	user, err = db.CreateUser("test")
-	c.Assert(err, check.IsNil)
+				// Verify preauth key credential was deleted.
+				var foundPak types.Credential
 
-	pak, err = db.CreatePreAuthKey(user.Name, false, false, nil, nil)
-	c.Assert(err, check.IsNil)
+				result := db.DB.First(&foundPak, "kind = ? AND id = ?", types.CredentialPreAuthKey, pak.ID)
+				assert.ErrorIs(t, result.Error, gorm.ErrRecordNotFound)
+			},
+		},
+		{
+			name: "error_user_has_nodes",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
 
-	node := types.Node{
-		ID:             0,
-		MachineKey:     "foo",
-		NodeKey:        "bar",
-		DiscoKey:       "faa",
-		Hostname:       "testnode",
-		UserID:         user.ID,
-		RegisterMethod: util.RegisterMethodAuthKey,
-		AuthKeyID:      uint(pak.ID),
+				user, err := db.CreateUser(types.User{Name: "test"})
+				require.NoError(t, err)
+
+				pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+				require.NoError(t, err)
+
+				pakID := pak.ID
+
+				node := types.Node{
+					ID:             0,
+					Hostname:       "testnode",
+					UserID:         &user.ID,
+					RegisterMethod: util.RegisterMethodAuthKey,
+					AuthKeyID:      &pakID,
+				}
+				trx := db.DB.Save(&node)
+				require.NoError(t, trx.Error)
+
+				err = db.DestroyUser(types.UserID(user.ID))
+				require.ErrorIs(t, err, ErrUserStillHasNodes)
+				// The error names the blocking node so it can be found.
+				require.ErrorContains(t, err, fmt.Sprintf("%d (testnode)", node.ID))
+			},
+		},
+		{
+			// https://github.com/juanfont/headscale/issues/3077
+			// Tagged nodes have user_id = NULL, so they do not block
+			// user deletion and are unaffected by ON DELETE CASCADE.
+			name: "success_user_only_has_tagged_nodes",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
+
+				user, err := db.CreateUser(types.User{Name: "test"})
+				require.NoError(t, err)
+
+				// Create a tagged node with no user_id (the rule for tagged nodes).
+				node := types.Node{
+					ID:             0,
+					Hostname:       "tagged-node",
+					RegisterMethod: util.RegisterMethodAuthKey,
+					Tags:           []string{"tag:server"},
+				}
+				trx := db.DB.Save(&node)
+				require.NoError(t, trx.Error)
+
+				err = db.DestroyUser(types.UserID(user.ID))
+				require.NoError(t, err)
+
+				// User is gone.
+				_, err = db.GetUserByID(types.UserID(user.ID))
+				require.ErrorIs(t, err, ErrUserNotFound)
+
+				// Tagged node survives.
+				var survivingNode types.Node
+
+				result := db.DB.First(&survivingNode, "id = ?", node.ID)
+				require.NoError(t, result.Error)
+				assert.Nil(t, survivingNode.UserID)
+				assert.Equal(t, []string{"tag:server"}, survivingNode.Tags.List())
+			},
+		},
+		{
+			// A user who has both tagged and user-owned nodes cannot
+			// be deleted; the user-owned nodes still block deletion.
+			name: "error_user_has_tagged_and_owned_nodes",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
+
+				user, err := db.CreateUser(types.User{Name: "test"})
+				require.NoError(t, err)
+
+				// Tagged node: no user_id.
+				taggedNode := types.Node{
+					ID:             0,
+					Hostname:       "tagged-node",
+					RegisterMethod: util.RegisterMethodAuthKey,
+					Tags:           []string{"tag:server"},
+				}
+				trx := db.DB.Save(&taggedNode)
+				require.NoError(t, trx.Error)
+
+				// User-owned node: has user_id.
+				ownedNode := types.Node{
+					ID:             0,
+					Hostname:       "owned-node",
+					UserID:         &user.ID,
+					RegisterMethod: util.RegisterMethodAuthKey,
+				}
+				trx = db.DB.Save(&ownedNode)
+				require.NoError(t, trx.Error)
+
+				err = db.DestroyUser(types.UserID(user.ID))
+				require.ErrorIs(t, err, ErrUserStillHasNodes)
+			},
+		},
+		{
+			// Regression test for https://github.com/juanfont/headscale/issues/3154
+			// DestroyUser must only delete the target user's pre-auth keys,
+			// not all pre-auth keys in the database.
+			name: "success_only_deletes_own_preauthkeys",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
+
+				userA := db.CreateUserForTest("usera")
+				userB := db.CreateUserForTest("userb")
+
+				// Create 2 keys for userA, 1 key for userB.
+				_, err := db.CreatePreAuthKey(userA.TypedID(), false, false, nil, nil)
+				require.NoError(t, err)
+				_, err = db.CreatePreAuthKey(userA.TypedID(), false, false, nil, nil)
+				require.NoError(t, err)
+				_, err = db.CreatePreAuthKey(userB.TypedID(), false, false, nil, nil)
+				require.NoError(t, err)
+
+				// Sanity check: 3 keys exist.
+				allKeys, err := db.ListPreAuthKeys()
+				require.NoError(t, err)
+				require.Len(t, allKeys, 3)
+
+				// Delete userB.
+				err = db.DestroyUser(types.UserID(userB.ID))
+				require.NoError(t, err)
+
+				// Only userA's 2 keys should remain.
+				remaining, err := db.ListPreAuthKeys()
+				require.NoError(t, err)
+				assert.Len(t, remaining, 2,
+					"expected 2 keys for userA, got %d — DestroyUser deleted keys from other users",
+					len(remaining))
+
+				for _, key := range remaining {
+					assert.NotNil(t, key.UserID)
+					assert.Equal(t, userA.ID, *key.UserID,
+						"remaining key should belong to userA")
+				}
+			},
+		},
 	}
-	db.db.Save(&node)
 
-	err = db.DestroyUser("test")
-	c.Assert(err, check.Equals, ErrUserStillHasNodes)
-}
+	// User deletion depends on foreign-key actions that differ between the
+	// hand-written SQLite schema and the GORM-generated Postgres schema, so
+	// run every case on both. The Postgres variant skips when no local
+	// server can be started.
+	for _, tt := range tests {
+		t.Run(tt.name+"-sqlite", func(t *testing.T) {
+			db, err := newSQLiteTestDB()
+			require.NoError(t, err)
 
-func (s *Suite) TestRenameUser(c *check.C) {
-	userTest, err := db.CreateUser("test")
-	c.Assert(err, check.IsNil)
-	c.Assert(userTest.Name, check.Equals, "test")
-
-	users, err := db.ListUsers()
-	c.Assert(err, check.IsNil)
-	c.Assert(len(users), check.Equals, 1)
-
-	err = db.RenameUser("test", "test-renamed")
-	c.Assert(err, check.IsNil)
-
-	_, err = db.GetUser("test")
-	c.Assert(err, check.Equals, ErrUserNotFound)
-
-	_, err = db.GetUser("test-renamed")
-	c.Assert(err, check.IsNil)
-
-	err = db.RenameUser("test-does-not-exit", "test")
-	c.Assert(err, check.Equals, ErrUserNotFound)
-
-	userTest2, err := db.CreateUser("test2")
-	c.Assert(err, check.IsNil)
-	c.Assert(userTest2.Name, check.Equals, "test2")
-
-	err = db.RenameUser("test2", "test-renamed")
-	c.Assert(err, check.Equals, ErrUserExists)
-}
-
-func (s *Suite) TestSetMachineUser(c *check.C) {
-	oldUser, err := db.CreateUser("old")
-	c.Assert(err, check.IsNil)
-
-	newUser, err := db.CreateUser("new")
-	c.Assert(err, check.IsNil)
-
-	pak, err := db.CreatePreAuthKey(oldUser.Name, false, false, nil, nil)
-	c.Assert(err, check.IsNil)
-
-	node := types.Node{
-		ID:             0,
-		MachineKey:     "foo",
-		NodeKey:        "bar",
-		DiscoKey:       "faa",
-		Hostname:       "testnode",
-		UserID:         oldUser.ID,
-		RegisterMethod: util.RegisterMethodAuthKey,
-		AuthKeyID:      uint(pak.ID),
+			tt.test(t, db)
+		})
+		t.Run(tt.name+"-postgres", func(t *testing.T) {
+			tt.test(t, newPostgresTestDB(t))
+		})
 	}
-	db.db.Save(&node)
-	c.Assert(node.UserID, check.Equals, oldUser.ID)
+}
 
-	err = db.AssignNodeToUser(&node, newUser.Name)
-	c.Assert(err, check.IsNil)
-	c.Assert(node.UserID, check.Equals, newUser.ID)
-	c.Assert(node.User.Name, check.Equals, newUser.Name)
+func TestGetUserErrorPropagation(t *testing.T) {
+	lookups := []struct {
+		name string
+		get  func(*HSDatabase) (*types.User, error)
+	}{
+		{
+			name: "by_id",
+			get:  func(db *HSDatabase) (*types.User, error) { return db.GetUserByID(1) },
+		},
+		{
+			name: "by_oidc_identifier",
+			get:  func(db *HSDatabase) (*types.User, error) { return db.GetUserByOIDCIdentifier("oidc-id") },
+		},
+	}
 
-	err = db.AssignNodeToUser(&node, "non-existing-user")
-	c.Assert(err, check.Equals, ErrUserNotFound)
+	tests := []struct {
+		name    string
+		closeDB bool
+		wantErr error
+	}{
+		{name: "missing_row_is_not_found", wantErr: ErrUserNotFound},
+		{name: "query_failure_is_returned", closeDB: true},
+	}
 
-	err = db.AssignNodeToUser(&node, newUser.Name)
-	c.Assert(err, check.IsNil)
-	c.Assert(node.UserID, check.Equals, newUser.ID)
-	c.Assert(node.User.Name, check.Equals, newUser.Name)
+	for _, lookup := range lookups {
+		for _, tt := range tests {
+			t.Run(lookup.name+"/"+tt.name, func(t *testing.T) {
+				db, err := newSQLiteTestDB()
+				require.NoError(t, err)
+
+				if tt.closeDB {
+					sqlDB, err := db.DB.DB()
+					require.NoError(t, err)
+					require.NoError(t, sqlDB.Close())
+				}
+
+				user, err := lookup.get(db)
+
+				// A swallowed error surfaces as a zero user and a nil error.
+				require.Error(t, err)
+				assert.Nil(t, user)
+
+				if tt.wantErr != nil {
+					assert.ErrorIs(t, err, tt.wantErr)
+				} else {
+					assert.NotErrorIs(t, err, ErrUserNotFound)
+				}
+			})
+		}
+	}
+}
+
+func TestRenameUser(t *testing.T) {
+	tests := []struct {
+		name string
+		test func(*testing.T, *HSDatabase)
+	}{
+		{
+			name: "success_rename",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
+
+				userTest := db.CreateUserForTest("test")
+				assert.Equal(t, "test", userTest.Name)
+
+				users, err := db.ListUsers(nil)
+				require.NoError(t, err)
+				assert.Len(t, users, 1)
+
+				err = db.RenameUser(types.UserID(userTest.ID), "test-renamed")
+				require.NoError(t, err)
+
+				users, err = db.ListUsers(&types.User{Name: "test"})
+				require.NoError(t, err)
+				assert.Empty(t, users)
+
+				users, err = db.ListUsers(&types.User{Name: "test-renamed"})
+				require.NoError(t, err)
+				assert.Len(t, users, 1)
+			},
+		},
+		{
+			name: "error_user_not_found",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
+
+				err := db.RenameUser(99988, "test")
+				assert.ErrorIs(t, err, ErrUserNotFound)
+			},
+		},
+		{
+			name: "error_duplicate_name",
+			test: func(t *testing.T, db *HSDatabase) {
+				t.Helper()
+
+				userTest := db.CreateUserForTest("test")
+				userTest2 := db.CreateUserForTest("test2")
+
+				assert.Equal(t, "test", userTest.Name)
+				assert.Equal(t, "test2", userTest2.Name)
+
+				err := db.RenameUser(types.UserID(userTest2.ID), "test")
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "UNIQUE constraint failed")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, err := newSQLiteTestDB()
+			require.NoError(t, err)
+
+			tt.test(t, db)
+		})
+	}
 }
