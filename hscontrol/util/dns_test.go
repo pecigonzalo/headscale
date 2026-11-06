@@ -5,228 +5,160 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"tailscale.com/util/dnsname"
+	"tailscale.com/util/must"
 )
 
-func TestNormalizeToFQDNRules(t *testing.T) {
-	type args struct {
-		name             string
-		stripEmailDomain bool
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    string
-		wantErr bool
-	}{
-		{
-			name: "normalize simple name",
-			args: args{
-				name:             "normalize-simple.name",
-				stripEmailDomain: false,
-			},
-			want:    "normalize-simple.name",
-			wantErr: false,
-		},
-		{
-			name: "normalize an email",
-			args: args{
-				name:             "foo.bar@example.com",
-				stripEmailDomain: false,
-			},
-			want:    "foo.bar.example.com",
-			wantErr: false,
-		},
-		{
-			name: "normalize an email domain should be removed",
-			args: args{
-				name:             "foo.bar@example.com",
-				stripEmailDomain: true,
-			},
-			want:    "foo.bar",
-			wantErr: false,
-		},
-		{
-			name: "strip enabled no email passed as argument",
-			args: args{
-				name:             "not-email-and-strip-enabled",
-				stripEmailDomain: true,
-			},
-			want:    "not-email-and-strip-enabled",
-			wantErr: false,
-		},
-		{
-			name: "normalize complex email",
-			args: args{
-				name:             "foo.bar+complex-email@example.com",
-				stripEmailDomain: false,
-			},
-			want:    "foo.bar-complex-email.example.com",
-			wantErr: false,
-		},
-		{
-			name: "user name with space",
-			args: args{
-				name:             "name space",
-				stripEmailDomain: false,
-			},
-			want:    "name-space",
-			wantErr: false,
-		},
-		{
-			name: "user with quote",
-			args: args{
-				name:             "Jamie's iPhone 5",
-				stripEmailDomain: false,
-			},
-			want:    "jamies-iphone-5",
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := NormalizeToFQDNRules(tt.args.name, tt.args.stripEmailDomain)
-			if (err != nil) != tt.wantErr {
-				t.Errorf(
-					"NormalizeToFQDNRules() error = %v, wantErr %v",
-					err,
-					tt.wantErr,
-				)
-
-				return
-			}
-			if got != tt.want {
-				t.Errorf("NormalizeToFQDNRules() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCheckForFQDNRules(t *testing.T) {
-	type args struct {
-		name string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		wantErr bool
-	}{
-		{
-			name:    "valid: user",
-			args:    args{name: "valid-user"},
-			wantErr: false,
-		},
-		{
-			name:    "invalid: capitalized user",
-			args:    args{name: "Invalid-CapItaLIzed-user"},
-			wantErr: true,
-		},
-		{
-			name:    "invalid: email as user",
-			args:    args{name: "foo.bar@example.com"},
-			wantErr: true,
-		},
-		{
-			name:    "invalid: chars in user name",
-			args:    args{name: "super-user+name"},
-			wantErr: true,
-		},
-		{
-			name: "invalid: too long name for user",
-			args: args{
-				name: "super-long-useruseruser-name-that-should-be-a-little-more-than-63-chars",
-			},
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := CheckForFQDNRules(tt.args.name); (err != nil) != tt.wantErr {
-				t.Errorf("CheckForFQDNRules() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
 func TestMagicDNSRootDomains100(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("100.64.0.0/10"),
-	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+	domains := GenerateIPv4DNSRootDomain(netip.MustParsePrefix("100.64.0.0/10"))
 
-	found := false
-	for _, domain := range domains {
-		if domain == "64.100.in-addr.arpa." {
-			found = true
-
-			break
-		}
-	}
-	assert.True(t, found)
-
-	found = false
-	for _, domain := range domains {
-		if domain == "100.100.in-addr.arpa." {
-			found = true
-
-			break
-		}
-	}
-	assert.True(t, found)
-
-	found = false
-	for _, domain := range domains {
-		if domain == "127.100.in-addr.arpa." {
-			found = true
-
-			break
-		}
-	}
-	assert.True(t, found)
+	assert.Contains(t, domains, must.Get(dnsname.ToFQDN("64.100.in-addr.arpa.")))
+	assert.Contains(t, domains, must.Get(dnsname.ToFQDN("100.100.in-addr.arpa.")))
+	assert.Contains(t, domains, must.Get(dnsname.ToFQDN("127.100.in-addr.arpa.")))
 }
 
 func TestMagicDNSRootDomains172(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("172.16.0.0/16"),
+	domains := GenerateIPv4DNSRootDomain(netip.MustParsePrefix("172.16.0.0/16"))
+
+	assert.Len(t, domains, 1)
+	assert.Contains(t, domains, must.Get(dnsname.ToFQDN("16.172.in-addr.arpa.")))
+}
+
+// An octet-aligned mask has no wildcard bits, so it must yield exactly one
+// reverse-DNS name. Enumerating the next octet instead emits all 256 children
+// of that name, which can overflow a resolver's per-link domain limit.
+func TestMagicDNSRootDomainsOctetAligned(t *testing.T) {
+	for _, tt := range []struct {
+		prefix string
+		want   string
+	}{
+		{prefix: "0.0.0.0/0", want: "in-addr.arpa."},
+		{prefix: "100.0.0.0/8", want: "100.in-addr.arpa."},
+		{prefix: "100.120.0.5/24", want: "0.120.100.in-addr.arpa."},
+		{prefix: "100.120.0.0/16", want: "120.100.in-addr.arpa."},
+		{prefix: "100.120.0.0/24", want: "0.120.100.in-addr.arpa."},
+		{prefix: "100.120.0.5/32", want: "5.0.120.100.in-addr.arpa."},
+	} {
+		t.Run(tt.prefix, func(t *testing.T) {
+			domains := GenerateIPv4DNSRootDomain(netip.MustParsePrefix(tt.prefix))
+
+			assert.Len(t, domains, 1)
+			assert.Contains(t, domains, must.Get(dnsname.ToFQDN(tt.want)))
+		})
 	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+}
 
-	found := false
-	for _, domain := range domains {
-		if domain == "0.16.172.in-addr.arpa." {
-			found = true
+// An unaligned mask stops inside an octet, leaving wildcard bits that must
+// enumerate every value that octet takes within the prefix. RFC1035 reverse
+// delegation is per-octet, so a mask longer than /24 enumerates host names
+// rather than delegating classlessly (RFC2317), which is what Tailscale
+// expects.
+func TestMagicDNSRootDomainsUnaligned(t *testing.T) {
+	for _, tt := range []struct {
+		prefix string
+		count  int
+		first  string
+		last   string
+		absent []string
+	}{
+		{
+			prefix: "10.0.0.0/7",
+			count:  2,
+			first:  "10.in-addr.arpa.",
+			last:   "11.in-addr.arpa.",
+			absent: []string{"12.in-addr.arpa."},
+		},
+		{
+			// Host bits set: the range starts at the masked octet.
+			prefix: "100.65.0.0/10",
+			count:  64,
+			first:  "64.100.in-addr.arpa.",
+			last:   "127.100.in-addr.arpa.",
+			absent: []string{"128.100.in-addr.arpa."},
+		},
+		{
+			prefix: "10.0.0.0/9",
+			count:  128,
+			first:  "0.10.in-addr.arpa.",
+			last:   "127.10.in-addr.arpa.",
+			absent: []string{"128.10.in-addr.arpa."},
+		},
+		{
+			prefix: "100.64.0.0/10",
+			count:  64,
+			first:  "64.100.in-addr.arpa.",
+			last:   "127.100.in-addr.arpa.",
+			absent: []string{
+				"63.100.in-addr.arpa.",
+				"128.100.in-addr.arpa.",
+			},
+		},
+		{
+			prefix: "172.16.0.0/12",
+			count:  16,
+			first:  "16.172.in-addr.arpa.",
+			last:   "31.172.in-addr.arpa.",
+			absent: []string{
+				"15.172.in-addr.arpa.",
+				"32.172.in-addr.arpa.",
+			},
+		},
+		{
+			prefix: "100.120.0.0/17",
+			count:  128,
+			first:  "0.120.100.in-addr.arpa.",
+			last:   "127.120.100.in-addr.arpa.",
+			absent: []string{"128.120.100.in-addr.arpa."},
+		},
+		{
+			prefix: "192.168.0.0/23",
+			count:  2,
+			first:  "0.168.192.in-addr.arpa.",
+			last:   "1.168.192.in-addr.arpa.",
+			absent: []string{"2.168.192.in-addr.arpa."},
+		},
+		{
+			prefix: "100.120.0.0/25",
+			count:  128,
+			first:  "0.0.120.100.in-addr.arpa.",
+			last:   "127.0.120.100.in-addr.arpa.",
+			absent: []string{"128.0.120.100.in-addr.arpa."},
+		},
+		{
+			prefix: "100.120.0.4/30",
+			count:  4,
+			first:  "4.0.120.100.in-addr.arpa.",
+			last:   "7.0.120.100.in-addr.arpa.",
+			absent: []string{
+				"3.0.120.100.in-addr.arpa.",
+				"8.0.120.100.in-addr.arpa.",
+			},
+		},
+	} {
+		t.Run(tt.prefix, func(t *testing.T) {
+			domains := GenerateIPv4DNSRootDomain(netip.MustParsePrefix(tt.prefix))
 
-			break
-		}
+			assert.Len(t, domains, tt.count)
+			assert.Contains(t, domains, must.Get(dnsname.ToFQDN(tt.first)))
+			assert.Contains(t, domains, must.Get(dnsname.ToFQDN(tt.last)))
+
+			for _, dom := range tt.absent {
+				assert.NotContains(t, domains, must.Get(dnsname.ToFQDN(dom)))
+			}
+		})
 	}
-	assert.True(t, found)
-
-	found = false
-	for _, domain := range domains {
-		if domain == "255.16.172.in-addr.arpa." {
-			found = true
-
-			break
-		}
-	}
-	assert.True(t, found)
 }
 
 // Happens when netmask is a multiple of 4 bits (sounds likely).
 func TestMagicDNSRootDomainsIPv6Single(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
-	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+	domains := GenerateIPv6DNSRootDomain(netip.MustParsePrefix("fd7a:115c:a1e0::/48"))
 
 	assert.Len(t, domains, 1)
 	assert.Equal(t, "0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa.", domains[0].WithTrailingDot())
 }
 
 func TestMagicDNSRootDomainsIPv6SingleMultiple(t *testing.T) {
-	prefixes := []netip.Prefix{
-		netip.MustParsePrefix("fd7a:115c:a1e0::/50"),
-	}
-	domains := GenerateMagicDNSRootDomains(prefixes)
+	domains := GenerateIPv6DNSRootDomain(netip.MustParsePrefix("fd7a:115c:a1e0::/50"))
 
 	yieldsRoot := func(dom string) bool {
 		for _, candidate := range domains {

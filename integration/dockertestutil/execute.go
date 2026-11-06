@@ -4,12 +4,23 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/ory/dockertest/v3"
 )
 
-const dockerExecuteTimeout = time.Second * 30
+// defaultExecuteTimeout returns the timeout for docker exec commands.
+// On CI runners, docker exec latency is higher due to resource
+// contention, so the timeout is doubled.
+func defaultExecuteTimeout() time.Duration {
+	if util.IsCI() {
+		return 20 * time.Second
+	}
+
+	return 10 * time.Second
+}
 
 var (
 	ErrDockertestCommandFailed  = errors.New("dockertest command failed")
@@ -25,9 +36,32 @@ type ExecuteCommandOption func(*ExecuteCommandConfig) error
 func ExecuteCommandTimeout(timeout time.Duration) ExecuteCommandOption {
 	return ExecuteCommandOption(func(conf *ExecuteCommandConfig) error {
 		conf.timeout = timeout
-
 		return nil
 	})
+}
+
+// buffer is a goroutine safe [bytes.Buffer].
+type buffer struct {
+	store bytes.Buffer
+	mutex sync.Mutex
+}
+
+// Write appends the contents of p to the buffer, growing the buffer as needed. It returns
+// the number of bytes written.
+func (b *buffer) Write(p []byte) (int, error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	return b.store.Write(p)
+}
+
+// String returns the contents of the unread portion of the buffer
+// as a string.
+func (b *buffer) String() string {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	return b.store.String()
 }
 
 func ExecuteCommand(
@@ -36,15 +70,16 @@ func ExecuteCommand(
 	env []string,
 	options ...ExecuteCommandOption,
 ) (string, string, error) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	stdout := buffer{}
+	stderr := buffer{}
 
 	execConfig := ExecuteCommandConfig{
-		timeout: dockerExecuteTimeout,
+		timeout: defaultExecuteTimeout(),
 	}
 
 	for _, opt := range options {
-		if err := opt(&execConfig); err != nil {
+		err := opt(&execConfig)
+		if err != nil {
 			return "", "", fmt.Errorf("execute-command/options: %w", err)
 		}
 	}
@@ -62,11 +97,12 @@ func ExecuteCommand(
 		exitCode, err := resource.Exec(
 			cmd,
 			dockertest.ExecOptions{
-				Env:    append(env, "HEADSCALE_LOG_LEVEL=disabled"),
+				Env:    append(env, "HEADSCALE_LOG_LEVEL=info"),
 				StdOut: &stdout,
 				StdErr: &stderr,
 			},
 		)
+
 		resultChan <- result{exitCode, err}
 	}()
 
@@ -74,7 +110,7 @@ func ExecuteCommand(
 	select {
 	case res := <-resultChan:
 		if res.err != nil {
-			return stdout.String(), stderr.String(), res.err
+			return stdout.String(), stderr.String(), fmt.Errorf("command failed, stderr: %s: %w", stderr.String(), res.err)
 		}
 
 		if res.exitCode != 0 {
@@ -82,13 +118,11 @@ func ExecuteCommand(
 			// log.Println("Command: ", cmd)
 			// log.Println("stdout: ", stdout.String())
 			// log.Println("stderr: ", stderr.String())
-
-			return stdout.String(), stderr.String(), ErrDockertestCommandFailed
+			return stdout.String(), stderr.String(), fmt.Errorf("command failed, stderr: %s: %w", stderr.String(), ErrDockertestCommandFailed)
 		}
 
 		return stdout.String(), stderr.String(), nil
 	case <-time.After(execConfig.timeout):
-
-		return stdout.String(), stderr.String(), ErrDockertestCommandTimeout
+		return stdout.String(), stderr.String(), fmt.Errorf("command failed, stderr: %s: %w", stderr.String(), ErrDockertestCommandTimeout)
 	}
 }

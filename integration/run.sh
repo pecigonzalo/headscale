@@ -13,8 +13,10 @@ run_tests() {
 
 	for ((i = 1; i <= num_tests; i++)); do
 		docker network prune -f >/dev/null 2>&1
-		docker rm headscale-test-suite || true
-		docker kill "$(docker ps -q)" || true
+		docker rm headscale-test-suite >/dev/null 2>&1 || true
+		docker kill "$(docker ps -q)" >/dev/null 2>&1 || true
+
+		echo "Run $i"
 
 		start=$(date +%s)
 		docker run \
@@ -24,13 +26,13 @@ run_tests() {
 			--volume "$PWD:$PWD" -w "$PWD"/integration \
 			--volume /var/run/docker.sock:/var/run/docker.sock \
 			--volume "$PWD"/control_logs:/tmp/control \
+			-e "HEADSCALE_INTEGRATION_POSTGRES" \
 			golang:1 \
 			go test ./... \
-			-tags ts2019 \
 			-failfast \
 			-timeout 120m \
 			-parallel 1 \
-			-run "^$test_name\$" >/dev/null 2>&1
+			-run "^$test_name\$" >./control_logs/"$test_name"_"$i".log 2>&1
 		status=$?
 		end=$(date +%s)
 

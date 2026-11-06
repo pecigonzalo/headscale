@@ -1,0 +1,374 @@
+package state
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/dnsname"
+)
+
+func TestNewNodeStoreBumpsDuplicateNames(t *testing.T) {
+	nodes := types.Nodes{
+		{ID: 4, GivenName: "DB"},
+		{ID: 2, GivenName: "db"},
+		{ID: 1, GivenName: "db"},
+		{ID: 3, GivenName: "db-1"},
+		{ID: 5, GivenName: ""},
+		{ID: 6, GivenName: ""},
+	}
+	want := map[types.NodeID]string{
+		1: "db", 2: "db-2", 3: "db-1", 4: "DB-3", 5: "", 6: "",
+	}
+
+	for range 2 {
+		store := NewNodeStore(nodes, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+		for id, name := range want {
+			node, ok := store.GetNode(id)
+			require.True(t, ok)
+			assert.Equal(t, name, node.GivenName())
+		}
+	}
+
+	assert.Equal(t, "db", nodes[1].GivenName, "loading must not mutate the input rows")
+}
+
+func TestPutNodeBumpsPastReservedLabel(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
+		{Name: "laptop." + cfg.BaseDomain},
+		{Name: "laptop-1." + cfg.BaseDomain},
+	}}
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node := s.nodeStore.PutNode(createTestNode(1, 1, "alice", "laptop"))
+	require.Equal(t, "laptop-2", node.GivenName())
+}
+
+func TestSetGivenNameRejectsReservedLabel(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
+		{Name: "laptop." + cfg.BaseDomain},
+	}}
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	s.nodeStore.PutNode(createTestNode(1, 1, "alice", "phone"))
+	_, err = s.nodeStore.SetGivenName(1, "laptop")
+	require.ErrorIs(t, err, ErrGivenNameTaken)
+}
+
+// TestPutNodeGivenNameCollisionBumps is the reproduction for #3188.
+// Before the hostname-cleanroom rewrite, two nodes could be written
+// with the same GivenName, producing duplicates. After the rewrite,
+// the NodeStore writer goroutine detects GivenName collisions inside
+// applyBatch and appends -1, -2, … to make the label unique.
+func TestPutNodeGivenNameCollisionBumps(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	n1 := createTestNode(1, 1, "alice", "laptop")
+	n2 := createTestNode(2, 1, "alice", "laptop")
+	n3 := createTestNode(3, 1, "alice", "laptop")
+
+	got1 := store.PutNode(n1)
+	got2 := store.PutNode(n2)
+	got3 := store.PutNode(n3)
+
+	require.Equal(t, "laptop", got1.GivenName(), "first registration keeps base label")
+	require.Equal(t, "laptop-1", got2.GivenName(), "second registration bumps to -1")
+	require.Equal(t, "laptop-2", got3.GivenName(), "third registration bumps to -2")
+}
+
+func TestPutNodeBumpCutsLabelToFitSuffix(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	long := strings.Repeat("a", 63)
+
+	got := make([]string, 0, 12)
+	for id := range types.NodeID(12) {
+		got = append(got, store.PutNode(createTestNode(id+1, 1, "alice", long)).GivenName())
+	}
+
+	require.Equal(t, long, got[0])
+	require.Equal(t, long[:61]+"-1", got[1])
+	require.Equal(t, long[:60]+"-10", got[10])
+	require.Equal(t, long[:60]+"-11", got[11])
+	require.True(t, isAutoDerivedGivenName(got[10], long),
+		"a cut label still follows its hostname")
+}
+
+// TestPutNodeEmptyGivenNameFallsBackToNode covers the SaaS rule that
+// an empty sanitised label becomes the literal "node". Subsequent
+// empty-label registrations bump as usual.
+func TestPutNodeEmptyGivenNameFallsBackToNode(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	n1 := createTestNode(1, 1, "alice", "")
+	n1.GivenName = ""
+	n2 := createTestNode(2, 1, "alice", "")
+	n2.GivenName = ""
+
+	got1 := store.PutNode(n1)
+	got2 := store.PutNode(n2)
+
+	require.Equal(t, "node", got1.GivenName())
+	require.Equal(t, "node-1", got2.GivenName())
+}
+
+// TestPutNodeIdempotentKeepsLabel asserts that re-putting the same
+// node (same ID, same GivenName) does not bump its own label.
+func TestPutNodeIdempotentKeepsLabel(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	n := createTestNode(1, 1, "alice", "laptop")
+	first := store.PutNode(n)
+	require.Equal(t, "laptop", first.GivenName())
+
+	second := store.PutNode(n)
+	require.Equal(t, "laptop", second.GivenName(), "re-put of same node must not bump its own label")
+}
+
+// TestUpdateNodeBumpsOnCollision asserts that UpdateNode also runs
+// the collision-bump branch when a callback rewrites GivenName to a
+// label held by another node.
+func TestUpdateNodeBumpsOnCollision(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	store.PutNode(createTestNode(1, 1, "alice", "laptop"))
+	store.PutNode(createTestNode(2, 1, "alice", "phone"))
+
+	view, ok := store.UpdateNode(2, func(n *types.Node) {
+		n.GivenName = "laptop"
+	})
+	require.True(t, ok)
+	require.Equal(t, "laptop-1", view.GivenName(), "UpdateNode must bump on collision")
+}
+
+// TestConcurrentPutNodeSameGivenNameAllUnique is the race regression
+// for the plan's safety argument: N goroutines concurrently PutNode
+// with the same GivenName and distinct IDs. All N stored labels must
+// be unique (no two nodes holding the same GivenName).
+func TestConcurrentPutNodeSameGivenNameAllUnique(t *testing.T) {
+	const N = 20
+
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	var wg sync.WaitGroup
+
+	results := make(chan string, N)
+	for id := range N {
+		wg.Go(func() {
+			n := createTestNode(types.NodeID(id+1), 1, "alice", "laptop") //nolint:gosec // test ids
+
+			view := store.PutNode(n)
+			results <- view.GivenName()
+		})
+	}
+
+	wg.Wait()
+	close(results)
+
+	seen := make(map[string]struct{}, N)
+	for label := range results {
+		if _, dup := seen[label]; dup {
+			t.Fatalf("duplicate label %q across concurrent PutNode", label)
+		}
+
+		seen[label] = struct{}{}
+	}
+
+	require.Len(t, seen, N, "all concurrent PutNodes must land with unique labels")
+
+	for i := range N {
+		want := "laptop"
+		if i > 0 {
+			want = fmt.Sprintf("laptop-%d", i)
+		}
+
+		if _, ok := seen[want]; !ok {
+			t.Errorf("expected label %q in result set, got %v", want, seen)
+		}
+	}
+}
+
+// TestSetGivenNameSuccess renames a node to a free label and asserts
+// the NodeView reflects the new label.
+func TestSetGivenNameSuccess(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	store.PutNode(createTestNode(1, 1, "alice", "laptop"))
+
+	view, err := store.SetGivenName(1, "workhorse")
+	require.NoError(t, err)
+	require.Equal(t, "workhorse", view.GivenName())
+}
+
+// TestSetGivenNameRejectsTaken refuses to rename a node to a label
+// held by a different node, leaving both labels unchanged.
+func TestSetGivenNameRejectsTaken(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	store.PutNode(createTestNode(1, 1, "alice", "laptop"))
+	store.PutNode(createTestNode(2, 1, "alice", "phone"))
+
+	_, err := store.SetGivenName(2, "laptop")
+	require.ErrorIs(t, err, ErrGivenNameTaken)
+
+	view, _ := store.GetNode(2)
+	require.Equal(t, "phone", view.GivenName(), "rejected rename must not mutate state")
+}
+
+// TestGivenNameCollisionIgnoresCase covers mixed-case names from before
+// renames were lowercased: "Laptop" and "laptop" are one DNS name, so a
+// certificate for one would be valid for the other.
+func TestGivenNameCollisionIgnoresCase(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	store.PutNode(createTestNode(1, 1, "alice", "Laptop"))
+	store.PutNode(createTestNode(2, 1, "alice", "phone"))
+
+	_, err := store.SetGivenName(2, "laptop")
+	require.ErrorIs(t, err, ErrGivenNameTaken)
+
+	got := store.PutNode(createTestNode(3, 1, "alice", "laptop"))
+	require.Equal(t, "laptop-1", got.GivenName())
+}
+
+// TestSetGivenNameRejectsInvalid returns ErrGivenNameInvalid for
+// labels that are not valid DNS labels.
+func TestSetGivenNameRejectsInvalid(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	store.PutNode(createTestNode(1, 1, "alice", "laptop"))
+
+	for _, bad := range []string{"Joe's Mac", "has space", "-leading", "trailing-", "", "dot.in.label"} {
+		_, err := store.SetGivenName(1, bad)
+		require.ErrorIsf(t, err, ErrGivenNameInvalid, "label %q must reject as invalid", bad)
+	}
+}
+
+// TestSetGivenNameRejectsMissingNode returns ErrNodeNotFound.
+func TestSetGivenNameRejectsMissingNode(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	_, err := store.SetGivenName(999, "something")
+	require.ErrorIs(t, err, ErrNodeNotFound, "got %v", err)
+}
+
+// TestSetGivenNameIdempotent renaming a node to its own current label
+// succeeds (not a collision against itself).
+func TestSetGivenNameIdempotent(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	store.PutNode(createTestNode(1, 1, "alice", "laptop"))
+
+	view, err := store.SetGivenName(1, "laptop")
+	require.NoError(t, err)
+	require.Equal(t, "laptop", view.GivenName())
+}
+
+func TestPutNodeGivenNameBumpFitsDNSLabel(t *testing.T) {
+	maxLabel := strings.Repeat("a", util.LabelHostnameLength)
+
+	tests := []struct {
+		name     string
+		hostname string
+		holders  int
+		want     string
+	}{
+		{name: "short base keeps full base", hostname: "laptop", holders: 1, want: "laptop-1"},
+		{name: "max length base trimmed for one digit suffix", hostname: maxLabel, holders: 1, want: strings.Repeat("a", 61) + "-1"},
+		{name: "max length base trimmed for two digit suffix", hostname: maxLabel, holders: 10, want: strings.Repeat("a", 60) + "-10"},
+		{name: "hyphen left at cut point is stripped", hostname: strings.Repeat("a", 60) + "-bb", holders: 1, want: strings.Repeat("a", 60) + "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+			store.Start()
+			defer store.Stop()
+
+			for id := range tt.holders {
+				store.PutNode(createTestNode(types.NodeID(id+1), 1, "alice", tt.hostname)) //nolint:gosec // test ids
+			}
+
+			got := store.PutNode(createTestNode(types.NodeID(tt.holders+1), 1, "alice", tt.hostname)).GivenName() //nolint:gosec // test ids
+
+			require.Equal(t, tt.want, got)
+			require.NoError(t, dnsname.ValidLabel(got))
+		})
+	}
+}
+
+func TestIsAutoDerivedGivenName(t *testing.T) {
+	maxLabel := strings.Repeat("a", util.LabelHostnameLength)
+
+	tests := []struct {
+		name     string
+		given    string
+		hostname string
+		want     bool
+	}{
+		{name: "sanitised hostname", given: "laptop", hostname: "laptop", want: true},
+		{name: "short bump", given: "laptop-1", hostname: "laptop", want: true},
+		{name: "signed suffix is not a generated name", given: "laptop-+1", hostname: "laptop", want: false},
+		{name: "trimmed max length bump", given: strings.Repeat("a", 61) + "-1", hostname: maxLabel, want: true},
+		{name: "hyphen trimmed at cut point", given: strings.Repeat("a", 60) + "-1", hostname: strings.Repeat("a", 60) + "-bb", want: true},
+		{name: "legacy hyphen kept at cut point", given: strings.Repeat("a", 60) + "--1", hostname: strings.Repeat("a", 60) + "-bb", want: true},
+		{name: "zero padded suffix is not a generated name", given: "laptop-01", hostname: "laptop", want: false},
+		{name: "admin name with repeated hyphen", given: "laptop--1", hostname: "laptop", want: false},
+		{name: "trimmed prefix with mismatched suffix length", given: strings.Repeat("a", 61) + "-10", hostname: maxLabel, want: false},
+		{name: "admin rename", given: "workstation", hostname: "laptop", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, isAutoDerivedGivenName(tt.given, tt.hostname))
+		})
+	}
+}

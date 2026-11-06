@@ -1,19 +1,17 @@
 package cli
 
 import (
-	"fmt"
 	"os"
 	"runtime"
+	"slices"
+	"strings"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/tcnksm/go-latest"
-)
-
-const (
-	deprecateNamespaceMessage = "use --user"
 )
 
 var cfgFile string = ""
@@ -31,32 +29,34 @@ func init() {
 		StringP("output", "o", "", "Output format. Empty for human-readable, 'json', 'json-line' or 'yaml'")
 	rootCmd.PersistentFlags().
 		Bool("force", false, "Disable prompts and forces the execution")
+
+	// Re-enable usage output only for flag-parsing errors; runtime errors
+	// from [cobra.Command.RunE] should never dump usage text.
+	rootCmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
+		cmd.SilenceUsage = false
+
+		return err
+	})
 }
 
 func initConfig() {
 	if cfgFile == "" {
 		cfgFile = os.Getenv("HEADSCALE_CONFIG")
 	}
+
 	if cfgFile != "" {
 		err := types.LoadConfig(cfgFile, true)
 		if err != nil {
-			log.Fatal().Caller().Err(err).Msgf("Error loading config file %s", cfgFile)
+			log.Fatal().Caller().Err(err).Msgf("error loading config file %s", cfgFile)
 		}
 	} else {
 		err := types.LoadConfig("", false)
 		if err != nil {
-			log.Fatal().Caller().Err(err).Msgf("Error loading config")
+			log.Fatal().Caller().Err(err).Msgf("error loading config")
 		}
 	}
 
-	cfg, err := types.GetHeadscaleConfig()
-	if err != nil {
-		log.Fatal().Caller().Err(err).Msg("Failed to get headscale configuration")
-	}
-
-	machineOutput := HasMachineOutputFlag()
-
-	zerolog.SetGlobalLevel(cfg.Log.Level)
+	machineOutput := hasMachineOutputFlag()
 
 	// If the user has requested a "node" readable format,
 	// then disable login so the output remains valid.
@@ -64,27 +64,60 @@ func initConfig() {
 		zerolog.SetGlobalLevel(zerolog.Disabled)
 	}
 
-	if cfg.Log.Format == types.JSONLogFormat {
+	logFormat := viper.GetString("log.format")
+	if logFormat == types.JSONLogFormat {
 		log.Logger = log.Output(os.Stdout)
 	}
 
-	if !cfg.DisableUpdateCheck && !machineOutput {
+	disableUpdateCheck := viper.GetBool("disable_check_updates")
+	if !disableUpdateCheck && !machineOutput {
+		versionInfo := types.GetVersionInfo()
 		if (runtime.GOOS == "linux" || runtime.GOOS == "darwin") &&
-			Version != "dev" {
+			!versionInfo.Dirty {
 			githubTag := &latest.GithubTag{
-				Owner:      "juanfont",
-				Repository: "headscale",
+				Owner:         "juanfont",
+				Repository:    "headscale",
+				TagFilterFunc: filterPreReleasesIfStable(func() string { return versionInfo.Version }),
 			}
-			res, err := latest.Check(githubTag, Version)
+
+			res, err := latest.Check(githubTag, versionInfo.Version)
 			if err == nil && res.Outdated {
 				//nolint
-				fmt.Printf(
+				log.Warn().Msgf(
 					"An updated version of Headscale has been found (%s vs. your current %s). Check it out https://github.com/juanfont/headscale/releases\n",
 					res.Current,
-					Version,
+					versionInfo.Version,
 				)
 			}
 		}
+	}
+}
+
+var prereleases = []string{"alpha", "beta", "rc", "dev"}
+
+func isPreReleaseVersion(version string) bool {
+	return slices.ContainsFunc(prereleases, func(unstable string) bool {
+		return strings.Contains(version, unstable)
+	})
+}
+
+// filterPreReleasesIfStable returns a function that filters out
+// pre-release tags if the current version is stable.
+// If the current version is a pre-release, it does not filter anything.
+// versionFunc is a function that returns the current version string, it is
+// a func for testability.
+func filterPreReleasesIfStable(versionFunc func() string) func(string) bool {
+	return func(tag string) bool {
+		version := versionFunc()
+
+		// If we are on a pre-release version, then we do not filter anything
+		// as we want to recommend the user the latest pre-release.
+		if isPreReleaseVersion(version) {
+			return false
+		}
+
+		// If we are on a stable release, filter out pre-releases.
+		return isPreReleaseVersion(tag)
 	}
 }
 
@@ -95,11 +128,15 @@ var rootCmd = &cobra.Command{
 headscale is an open source implementation of the Tailscale control server
 
 https://github.com/juanfont/headscale`,
+	SilenceErrors: true,
+	SilenceUsage:  true,
 }
 
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	cmd, err := rootCmd.ExecuteC()
+	if err != nil {
+		outputFormat, _ := cmd.Flags().GetString("output")
+		printError(err, outputFormat)
 		os.Exit(1)
 	}
 }

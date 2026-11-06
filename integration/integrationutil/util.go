@@ -3,14 +3,51 @@ package integrationutil
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"path/filepath"
+	"time"
 
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"tailscale.com/tailcfg"
 )
+
+// PeerSyncTimeout returns the timeout for peer synchronization based on environment:
+// 60s for dev, 120s for CI.
+func PeerSyncTimeout() time.Duration {
+	if util.IsCI() {
+		return 120 * time.Second
+	}
+
+	return 60 * time.Second
+}
+
+// PeerSyncRetryInterval returns the retry interval for peer synchronization checks.
+func PeerSyncRetryInterval() time.Duration {
+	return 100 * time.Millisecond
+}
+
+// ScaledTimeout returns the given timeout, scaled for CI environments
+// where resource contention causes slower state propagation.
+// Uses a 2x multiplier, consistent with PeerSyncTimeout (60s/120s)
+// and dockertestMaxWait (300s/600s).
+func ScaledTimeout(d time.Duration) time.Duration {
+	if util.IsCI() {
+		return d * 2
+	}
+
+	return d
+}
 
 func WriteFileToContainer(
 	pool *dockertest.Pool,
@@ -35,17 +72,17 @@ func WriteFileToContainer(
 
 	err := tarWriter.WriteHeader(header)
 	if err != nil {
-		return fmt.Errorf("failed write file header to tar: %w", err)
+		return fmt.Errorf("writing file header to tar: %w", err)
 	}
 
 	_, err = io.Copy(tarWriter, file)
 	if err != nil {
-		return fmt.Errorf("failed to copy file to tar: %w", err)
+		return fmt.Errorf("copying file to tar: %w", err)
 	}
 
 	err = tarWriter.Close()
 	if err != nil {
-		return fmt.Errorf("failed to close tar: %w", err)
+		return fmt.Errorf("closing tar: %w", err)
 	}
 
 	// Ensure the directory is present inside the container
@@ -55,7 +92,7 @@ func WriteFileToContainer(
 		[]string{},
 	)
 	if err != nil {
-		return fmt.Errorf("failed to ensure directory: %w", err)
+		return fmt.Errorf("ensuring directory: %w", err)
 	}
 
 	err = pool.Client.UploadToContainer(
@@ -92,4 +129,138 @@ func FetchPathFromContainer(
 	}
 
 	return buf.Bytes(), nil
+}
+
+// nolint
+// CreateCertificate generates a CA certificate and a server certificate
+// signed by that CA for the given hostname. It returns the CA certificate
+// PEM (for trust stores), server certificate PEM, and server private key
+// PEM.
+func CreateCertificate(hostname string) (caCertPEM, certPEM, keyPEM []byte, err error) {
+	// From:
+	// https://shaneutt.com/blog/golang-ca-and-signed-cert-go/
+
+	ca := &x509.Certificate{
+		SerialNumber: big.NewInt(2019),
+		Subject: pkix.Name{
+			Organization: []string{"Headscale testing INC"},
+			Country:      []string{"NL"},
+			Locality:     []string{"Leiden"},
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(60 * time.Hour),
+		IsCA:      true,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageClientAuth,
+			x509.ExtKeyUsageServerAuth,
+		},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+
+	caPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	caBytes, err := x509.CreateCertificate(
+		rand.Reader,
+		ca,
+		ca,
+		&caPrivKey.PublicKey,
+		caPrivKey,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	caPEM := new(bytes.Buffer)
+	err = pem.Encode(caPEM, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caBytes,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(1658),
+		Subject: pkix.Name{
+			CommonName:   hostname,
+			Organization: []string{"Headscale testing INC"},
+			Country:      []string{"NL"},
+			Locality:     []string{"Leiden"},
+		},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(60 * time.Minute),
+		SubjectKeyId: []byte{1, 2, 3, 4, 6},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		DNSNames:     []string{hostname},
+	}
+
+	certPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	certBytes, err := x509.CreateCertificate(
+		rand.Reader,
+		cert,
+		ca,
+		&certPrivKey.PublicKey,
+		caPrivKey,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	serverCertPEM := new(bytes.Buffer)
+	err = pem.Encode(serverCertPEM, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certBytes,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	certPrivKeyPEM := new(bytes.Buffer)
+	err = pem.Encode(certPrivKeyPEM, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return caPEM.Bytes(), serverCertPEM.Bytes(), certPrivKeyPEM.Bytes(), nil
+}
+
+func BuildExpectedOnlineMap(all map[types.NodeID][]tailcfg.MapResponse) map[types.NodeID]map[types.NodeID]bool {
+	res := make(map[types.NodeID]map[types.NodeID]bool)
+	for nid, mrs := range all {
+		res[nid] = make(map[types.NodeID]bool)
+
+		set := func(id tailcfg.NodeID, online *bool) {
+			if online != nil {
+				res[nid][types.NodeID(id)] = *online //nolint:gosec // safe conversion for peer ID
+			}
+		}
+
+		for _, mr := range mrs {
+			for _, peer := range mr.Peers {
+				set(peer.ID, peer.Online)
+			}
+
+			for _, peer := range mr.PeersChanged {
+				set(peer.ID, peer.Online)
+			}
+
+			for _, peer := range mr.PeersChangedPatch {
+				set(peer.NodeID, peer.Online)
+			}
+		}
+	}
+
+	return res
 }

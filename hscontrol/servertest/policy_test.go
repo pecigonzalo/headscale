@@ -1,0 +1,464 @@
+package servertest_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/juanfont/headscale/hscontrol/servertest"
+	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/types/testcapture"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/types/netmap"
+)
+
+// TestPolicyChanges verifies that ACL policy changes propagate
+// correctly to all connected nodes, affecting peer visibility
+// and packet filters.
+func TestPolicyChanges(t *testing.T) {
+	t.Parallel()
+
+	t.Run("default_allow_all", func(t *testing.T) {
+		t.Parallel()
+		// With no explicit policy (database mode), the default
+		// is to allow all traffic. All nodes should see each other.
+		h := servertest.NewHarness(t, 3)
+		servertest.AssertMeshComplete(t, h.Clients())
+	})
+
+	t.Run("explicit_allow_all_policy", func(t *testing.T) {
+		t.Parallel()
+		h := servertest.NewHarness(t, 2)
+
+		// Record update counts before policy change.
+		countBefore := h.Client(0).UpdateCount()
+
+		// Set an allow-all policy explicitly.
+		h.ChangePolicy(t, []byte(`{
+			"acls": [
+				{"action": "accept", "src": ["*"], "dst": ["*:*"]}
+			]
+		}`))
+
+		// Both clients should receive an update after the policy change.
+		h.Client(0).WaitForCondition(t, "update after policy",
+			10*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				return h.Client(0).UpdateCount() > countBefore
+			})
+	})
+
+	t.Run("policy_with_allow_all_has_packet_filter", func(t *testing.T) {
+		t.Parallel()
+
+		srv := servertest.NewServer(t)
+		user := srv.CreateUser(t, "pf-user")
+
+		// Set a valid allow-all policy.
+		changed, err := srv.State().SetPolicy([]byte(`{
+			"acls": [
+				{"action": "accept", "src": ["*"], "dst": ["*:*"]}
+			]
+		}`))
+		require.NoError(t, err)
+
+		if changed {
+			changes, err := srv.State().ReloadPolicy()
+			require.NoError(t, err)
+			srv.App.Change(changes...)
+		}
+
+		c := servertest.NewClient(t, srv, "pf-node", servertest.WithUser(user))
+		c.WaitForUpdate(t, 15*time.Second)
+
+		nm := c.Netmap()
+		require.NotNil(t, nm)
+
+		// The netmap should have packet filter rules from the
+		// allow-all policy.
+		assert.NotNil(t, nm.PacketFilter,
+			"PacketFilter should be populated with allow-all rules")
+	})
+
+	t.Run("policy_change_triggers_update_on_all_nodes", func(t *testing.T) {
+		t.Parallel()
+		h := servertest.NewHarness(t, 3)
+
+		counts := make([]int, len(h.Clients()))
+		for i, c := range h.Clients() {
+			counts[i] = c.UpdateCount()
+		}
+
+		// Change policy.
+		h.ChangePolicy(t, []byte(`{
+			"acls": [
+				{"action": "accept", "src": ["*"], "dst": ["*:*"]}
+			]
+		}`))
+
+		// All clients should receive at least one more update.
+		for i, c := range h.Clients() {
+			c.WaitForCondition(t, "update after policy change",
+				10*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					return c.UpdateCount() > counts[i]
+				})
+		}
+	})
+
+	t.Run("multiple_policy_changes", func(t *testing.T) {
+		t.Parallel()
+		h := servertest.NewHarness(t, 2)
+
+		// Apply policy twice and verify updates arrive both times.
+		for round := range 2 {
+			countBefore := h.Client(0).UpdateCount()
+
+			h.ChangePolicy(t, []byte(`{
+				"acls": [
+					{"action": "accept", "src": ["*"], "dst": ["*:*"]}
+				]
+			}`))
+
+			h.Client(0).WaitForCondition(t, "update after policy change",
+				10*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					return h.Client(0).UpdateCount() > countBefore
+				})
+
+			t.Logf("round %d: update received", round)
+		}
+	})
+
+	// https://github.com/juanfont/headscale/issues/3508
+	t.Run("ssh_removal_clears_client_ssh_policy", func(t *testing.T) {
+		t.Parallel()
+		h := servertest.NewHarness(t, 2)
+
+		h.ChangePolicy(t, []byte(`{
+			"acls": [],
+			"ssh": [{
+				"action": "accept",
+				"src":    ["autogroup:member"],
+				"dst":    ["autogroup:self"],
+				"users":  ["root"]
+			}]
+		}`))
+
+		h.Client(0).WaitForCondition(t, "SSH rules present", 10*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				return nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
+			})
+
+		h.ChangePolicy(t, []byte(`{"acls": []}`))
+
+		h.Client(0).WaitForCondition(t, "SSH rules cleared", 10*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				return nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) == 0
+			})
+	})
+
+	// An unchanged SSHPolicy is dropped from policy frames; the client
+	// must keep the rules it holds.
+	t.Run("unrelated_policy_change_keeps_client_ssh_rules", func(t *testing.T) {
+		t.Parallel()
+		h := servertest.NewHarness(t, 2)
+
+		withSSH := func(group string) []byte {
+			return fmt.Appendf(nil, `{
+				"groups": {%q: []},
+				"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
+				"ssh": [{
+					"action": "accept",
+					"src":    ["autogroup:member"],
+					"dst":    ["autogroup:self"],
+					"users":  ["root"]
+				}]
+			}`, "group:"+group)
+		}
+
+		h.ChangePolicy(t, withSSH("a"))
+		h.Client(0).WaitForCondition(t, "SSH rules present", 10*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				return nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
+			})
+
+		countBefore := h.Client(0).UpdateCount()
+
+		h.ChangePolicy(t, withSSH("b"))
+		h.Client(0).WaitForCondition(t, "policy update with SSH rules kept", 10*time.Second,
+			func(nm *netmap.NetworkMap) bool {
+				return h.Client(0).UpdateCount() > countBefore &&
+					nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
+			})
+	})
+
+	t.Run("policy_with_multiple_users", func(t *testing.T) {
+		t.Parallel()
+
+		srv := servertest.NewServer(t)
+		user1 := srv.CreateUser(t, "multi-user1")
+		user2 := srv.CreateUser(t, "multi-user2")
+		user3 := srv.CreateUser(t, "multi-user3")
+
+		c1 := servertest.NewClient(t, srv, "multi-node1", servertest.WithUser(user1))
+		c2 := servertest.NewClient(t, srv, "multi-node2", servertest.WithUser(user2))
+		c3 := servertest.NewClient(t, srv, "multi-node3", servertest.WithUser(user3))
+
+		// With default allow-all, all should see each other.
+		c1.WaitForPeers(t, 2, 15*time.Second)
+		c2.WaitForPeers(t, 2, 15*time.Second)
+		c3.WaitForPeers(t, 2, 15*time.Second)
+
+		servertest.AssertMeshComplete(t,
+			[]*servertest.TestClient{c1, c2, c3})
+	})
+}
+
+// TestIPv6OnlyPrefixACL verifies that an ACL using only IPv6 prefixes
+// correctly generates filter rules for IPv6 traffic. Address-based aliases
+// (Prefix, Host) resolve to exactly the literal prefix and do NOT expand
+// to include the matching node's other IP addresses.
+//
+// [netmap.NetworkMap.PacketFilter] rules are INBOUND: they tell the destination node what
+// traffic to accept. So the IPv6 destination rule appears in test2's
+// [netmap.NetworkMap.PacketFilter] (the destination), not test1's (the source).
+func TestIPv6OnlyPrefixACL(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	user := srv.CreateUser(t, "ipv6-user")
+
+	// Set a policy that only uses IPv6 prefixes.
+	changed, err := srv.State().SetPolicy([]byte(`{
+		"hosts": {
+			"test1": "fd7a:115c:a1e0::1/128",
+			"test2": "fd7a:115c:a1e0::2/128"
+		},
+		"acls": [{
+			"action": "accept",
+			"src": ["test1"],
+			"dst": ["test2:*"]
+		}]
+	}`))
+	require.NoError(t, err)
+
+	if changed {
+		changes, err := srv.State().ReloadPolicy()
+		require.NoError(t, err)
+		srv.App.Change(changes...)
+	}
+
+	c1 := servertest.NewClient(t, srv, "test1",
+		servertest.WithUser(user))
+	c2 := servertest.NewClient(t, srv, "test2",
+		servertest.WithUser(user))
+
+	c1.WaitForPeers(t, 1, 10*time.Second)
+	c2.WaitForPeers(t, 1, 10*time.Second)
+
+	// [netmap.NetworkMap.PacketFilter] is an INBOUND filter: test2 (the destination) should
+	// have the rule allowing traffic FROM test1's IPv6.
+	nm2 := c2.Netmap()
+	require.NotNil(t, nm2)
+	require.NotNil(t, nm2.PacketFilter,
+		"c2 PacketFilter should not be nil with IPv6-only policy")
+
+	// Verify that IPv6 destination is present in the filter rules on test2.
+	var foundIPv6Dst bool
+
+	expectedDst := netip.MustParseAddr("fd7a:115c:a1e0::2")
+
+	for _, m := range nm2.PacketFilter {
+		for _, dst := range m.Dsts {
+			if dst.Net.Addr() == expectedDst {
+				foundIPv6Dst = true
+			}
+		}
+	}
+
+	assert.True(t, foundIPv6Dst,
+		"test2 PacketFilter should contain IPv6 destination fd7a:115c:a1e0::2 from IPv6-only host definition")
+
+	// With the current resolve behavior, the filter should NOT contain
+	// the corresponding IPv4 address as a destination, because
+	// address-based aliases resolve to exactly the literal prefix.
+	var foundIPv4Dst bool
+
+	ipv4Dst := netip.MustParseAddr("100.64.0.2")
+
+	for _, m := range nm2.PacketFilter {
+		for _, dst := range m.Dsts {
+			if dst.Net.Addr() == ipv4Dst {
+				foundIPv4Dst = true
+			}
+		}
+	}
+
+	assert.False(t, foundIPv4Dst,
+		"test2 PacketFilter should NOT contain IPv4 destination 100.64.0.2 when policy only specifies IPv6 hosts")
+}
+
+// rejectedPolicySkipReasons lists refused captures where headscale differs,
+// keyed <test_id>/<check>. A listed check that passes fails, so a fix must
+// delete its entry.
+var rejectedPolicySkipReasons = map[string]string{
+	"ssh-b4/refused": noTailnetDomains,
+	"ssh-d1/refused": noTailnetDomains,
+	"ssh-e1/refused": noTailnetDomains,
+	"ssh-e2/refused": noTailnetDomains,
+	"ssh-malformed-user-localpart-multi-glob/refused": noTailnetDomains,
+
+	"routes-exit-family-ipv4/refused": aclDefaultRouteAccepted,
+	"routes-exit-family-ipv6/refused": aclDefaultRouteAccepted,
+
+	"nodeattrs-derpmap-node-tailscale-ip/refused": tailscaleDERPIPs,
+}
+
+const (
+	noTailnetDomains        = "NO_TAILNET_DOMAINS: headscale does not check user:*@domain or localpart:*@domain against the tailnet's domains"
+	aclDefaultRouteAccepted = "ACL_DEFAULT_ROUTE_ACCEPTED: headscale accepts literal 0.0.0.0/0 and ::/0 ACL destinations; SaaS rejects them and requires * or autogroup:internet"
+	tailscaleDERPIPs        = "TAILSCALE_DERP_IPS: SaaS refuses a policy derpMap node on a Tailscale DERP server's IP; that takes its live server list"
+)
+
+// TestRejectedPolicyLeavesLivePolicyCompat posts every policy SaaS refused to
+// the v2 API over the baseline tscap's reset leaves: tagOwners only.
+// Headscale must refuse it too and keep enforcing and serving the baseline,
+// as SaaS did.
+//
+// Test data source: ../policy/v2/testdata/*_results/, the error captures.
+func TestRejectedPolicyLeavesLivePolicyCompat(t *testing.T) {
+	t.Parallel()
+
+	files, err := filepath.Glob(filepath.Join("..", "policy", "v2", "testdata", "*_results", "*.hujson"))
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+
+	for _, file := range files {
+		c, err := testcapture.Read(file)
+		require.NoError(t, err, "reading %s", file)
+
+		if !c.Error {
+			continue
+		}
+
+		t.Run(c.TestID, func(t *testing.T) {
+			t.Parallel()
+
+			srv, apiKey := rejectedPolicyServer(t, c)
+			handler := srv.App.HTTPHandler()
+
+			before := livePolicy(t, srv, handler, apiKey)
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v2/tailnet/-/acl",
+				bytes.NewReader(convertCapturePolicy(t, c)))
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			req.Header.Set("Content-Type", "application/json")
+			handler.ServeHTTP(rec, req)
+
+			key := c.TestID + "/refused"
+			if reason, listed := rejectedPolicySkipReasons[key]; listed {
+				require.NotEqualf(t, http.StatusBadRequest, rec.Code,
+					"headscale refuses this policy; delete rejectedPolicySkipReasons[%q]", key)
+				require.Equalf(t, http.StatusOK, rec.Code,
+					"listed as accepted; headscale answered %d: %s", rec.Code, rec.Body)
+				t.Skip(reason)
+			}
+
+			require.Equalf(t, http.StatusBadRequest, rec.Code,
+				"SaaS refused this policy; headscale answered %d: %s", rec.Code, rec.Body)
+
+			assert.Equal(t, before, livePolicy(t, srv, handler, apiKey),
+				"a refused policy must leave the live policy as it was")
+		})
+	}
+}
+
+// rejectedPolicyServer starts a server holding the capture's topology and
+// a baseline where odin, the reset policy's owner, owns every topology tag.
+func rejectedPolicyServer(t *testing.T, c *testcapture.Capture) (*servertest.TestServer, string) {
+	t.Helper()
+
+	// Every staged node waits out a NodeStore batch; with no streams to
+	// coalesce, the default wait only adds time.
+	srv := servertest.NewServer(t, servertest.WithNodeStoreBatchTimeout(state.TestBatchTimeout))
+	users := createCaptureUsers(t, srv)
+
+	owners := map[string][]string{}
+
+	for _, n := range c.Topology.Nodes {
+		for _, tag := range n.Tags {
+			owners[tag] = []string{"odin@"}
+		}
+	}
+
+	baselineJSON, err := json.Marshal(map[string]any{"tagOwners": owners})
+	require.NoError(t, err)
+
+	st := srv.State()
+
+	_, err = st.SetPolicy(baselineJSON)
+	require.NoError(t, err, "baseline tagOwners should install")
+
+	_, err = st.SetPolicyInDB(string(baselineJSON))
+	require.NoError(t, err)
+
+	for name, topo := range c.Topology.Nodes {
+		owner := users["odin"]
+		if u, ok := users[topo.User]; ok {
+			owner = u
+		}
+
+		node := st.CreateRegisteredNodeForTest(owner, name)
+		node.User = owner
+		node.Tags = topo.Tags
+		v4, v6 := netip.MustParseAddr(topo.IPv4), netip.MustParseAddr(topo.IPv6)
+		node.IPv4, node.IPv6 = &v4, &v6
+		st.PutNodeInStoreForTest(*node)
+	}
+
+	require.NoError(t, st.UpdatePolicyManagerNodesForTest())
+
+	return srv, srv.CreateAPIKey(t, nil)
+}
+
+// livePolicyState is what the server enforces and serves.
+type livePolicyState struct {
+	Filter []tailcfg.FilterRule
+	SSH    map[string]*tailcfg.SSHPolicy
+	Body   string
+	ETag   string
+}
+
+func livePolicy(t *testing.T, srv *servertest.TestServer, handler http.Handler, apiKey string) livePolicyState {
+	t.Helper()
+
+	filter, _ := srv.State().Filter()
+	out := livePolicyState{Filter: filter, SSH: map[string]*tailcfg.SSHPolicy{}}
+
+	for _, n := range srv.State().ListNodes().All() {
+		ssh, err := srv.State().SSHPolicy(n)
+		require.NoError(t, err)
+
+		out.SSH[n.Hostname()] = ssh
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v2/tailnet/-/acl", nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	out.Body, out.ETag = rec.Body.String(), rec.Header().Get("ETag")
+
+	return out
+}
