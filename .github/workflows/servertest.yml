@@ -1,0 +1,38 @@
+name: Server Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-$${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+# hscontrol/servertest is excluded from the sandboxed gotest flake check: it is
+# slow (10s+ convergence cases) and timing-sensitive (race/stress/HA property
+# tests), so it runs here in the devShell with a generous timeout instead.
+defaults:
+  run:
+    shell: nix develop --fallback --command bash -e {0}
+
+permissions:
+  contents: read
+
+jobs:
+  servertest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: NixOS/nix-installer-action@v1.0.0
+      - uses: Mic92/hestia@v3.1.0
+
+      - name: go test ./hscontrol/servertest
+        env:
+          CGO_ENABLED: "0"
+        run: go test -timeout=40m ./hscontrol/servertest/...

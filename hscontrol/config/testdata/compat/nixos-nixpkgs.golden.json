@@ -1,0 +1,3 @@
+{
+  "error": "Fatal config error: configuration key tls_letsencrypt_cache_dir was removed in 0.30 ($DIR/config.yaml:56:1)\n  hint: use tls.acme.cache_dir\n\nFatal config error: configuration key tls_letsencrypt_challenge_type was removed in 0.30 ($DIR/config.yaml:57:1)\n  hint: use tls.acme.challenge_type\n\nFatal config error: configuration key tls_letsencrypt_hostname was removed in 0.30 ($DIR/config.yaml:58:1)\n  hint: use tls.acme.hostname\n\nFatal config error: configuration key tls_letsencrypt_listen was removed in 0.30 ($DIR/config.yaml:59:1)\n  hint: use tls.acme.http_listen\n"
+}

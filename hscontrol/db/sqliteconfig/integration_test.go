@@ -1,0 +1,399 @@
+package sqliteconfig
+
+import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	_ "modernc.org/sqlite"
+)
+
+const memoryDBPath = ":memory:"
+
+// TestSQLiteDriverPragmaIntegration verifies that the modernc.org/sqlite driver
+// correctly applies all pragma settings from URL parameters, ensuring they work
+// the same as the old SQL PRAGMA statements approach.
+func TestSQLiteDriverPragmaIntegration(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   *Config
+		expected map[string]any
+	}{
+		{
+			name:   "default configuration",
+			config: Default("/tmp/test.db"),
+			expected: map[string]any{
+				"busy_timeout":       10000,
+				"journal_mode":       "wal",
+				"auto_vacuum":        2, // INCREMENTAL = 2
+				"wal_autocheckpoint": 1000,
+				"synchronous":        1, // NORMAL = 1
+				"foreign_keys":       1, // ON = 1
+			},
+		},
+		{
+			name:   "memory database with foreign keys",
+			config: Memory(),
+			expected: map[string]any{
+				"foreign_keys": 1, // ON = 1
+			},
+		},
+		{
+			name: "custom configuration",
+			config: &Config{
+				Path:              "/tmp/custom.db",
+				BusyTimeout:       5000,
+				JournalMode:       JournalModeDelete,
+				AutoVacuum:        AutoVacuumFull,
+				WALAutocheckpoint: 1000,
+				Synchronous:       SynchronousFull,
+				ForeignKeys:       true,
+			},
+			expected: map[string]any{
+				"busy_timeout":       5000,
+				"journal_mode":       "delete",
+				"auto_vacuum":        1, // FULL = 1
+				"wal_autocheckpoint": 1000,
+				"synchronous":        2, // FULL = 2
+				"foreign_keys":       1, // ON = 1
+			},
+		},
+		{
+			name: "foreign keys disabled",
+			config: &Config{
+				Path:        "/tmp/no_fk.db",
+				ForeignKeys: false,
+			},
+			expected: map[string]any{
+				// foreign_keys should not be set (defaults to 0/OFF)
+				"foreign_keys": 0,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create temporary database file if not memory
+			if tt.config.Path == memoryDBPath {
+				// For memory databases, no changes needed
+			} else {
+				tempDir := t.TempDir()
+				dbPath := filepath.Join(tempDir, "test.db")
+				// Update config with actual temp path
+				configCopy := *tt.config
+				configCopy.Path = dbPath
+				tt.config = &configCopy
+			}
+
+			// Generate URL and open database
+			url, err := tt.config.ToURL()
+			if err != nil {
+				t.Fatalf("Failed to generate URL: %v", err)
+			}
+
+			t.Logf("Opening database with URL: %s", url)
+
+			db, err := sql.Open("sqlite", url)
+			if err != nil {
+				t.Fatalf("Failed to open database: %v", err)
+			}
+			defer db.Close()
+
+			// Test connection
+			ctx := context.Background()
+
+			err = db.PingContext(ctx)
+			if err != nil {
+				t.Fatalf("Failed to ping database: %v", err)
+			}
+
+			// Verify each expected pragma setting
+			for pragma, expectedValue := range tt.expected {
+				t.Run("pragma_"+pragma, func(t *testing.T) {
+					var actualValue any
+
+					query := "PRAGMA " + pragma
+
+					err := db.QueryRowContext(ctx, query).Scan(&actualValue)
+					if err != nil {
+						t.Fatalf("Failed to query %s: %v", query, err)
+					}
+
+					t.Logf("%s: expected=%v, actual=%v", pragma, expectedValue, actualValue)
+
+					// Handle type conversion for comparison
+					switch expected := expectedValue.(type) {
+					case int:
+						if actual, ok := actualValue.(int64); ok {
+							if int64(expected) != actual {
+								t.Errorf("%s: expected %d, got %d", pragma, expected, actual)
+							}
+						} else {
+							t.Errorf("%s: expected int %d, got %T %v", pragma, expected, actualValue, actualValue)
+						}
+					case string:
+						if actual, ok := actualValue.(string); ok {
+							if expected != actual {
+								t.Errorf("%s: expected %q, got %q", pragma, expected, actual)
+							}
+						} else {
+							t.Errorf("%s: expected string %q, got %T %v", pragma, expected, actualValue, actualValue)
+						}
+					default:
+						t.Errorf("Unsupported expected type for %s: %T", pragma, expectedValue)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestForeignKeyConstraintEnforcement verifies that foreign key constraints
+// are actually enforced when enabled via URL parameters.
+func TestForeignKeyConstraintEnforcement(t *testing.T) {
+	tempDir := t.TempDir()
+
+	dbPath := filepath.Join(tempDir, "fk_test.db")
+	config := Default(dbPath)
+
+	url, err := config.ToURL()
+	if err != nil {
+		t.Fatalf("Failed to generate URL: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", url)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create test tables with foreign key relationship
+	schema := `
+		CREATE TABLE parent (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+
+		CREATE TABLE child (
+			id INTEGER PRIMARY KEY,
+			parent_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			FOREIGN KEY (parent_id) REFERENCES parent(id)
+		);
+	`
+
+	_, err = db.ExecContext(ctx, schema)
+	if err != nil {
+		t.Fatalf("Failed to create schema: %v", err)
+	}
+
+	// Insert parent record
+	_, err = db.ExecContext(ctx, "INSERT INTO parent (id, name) VALUES (1, 'Parent 1')")
+	if err != nil {
+		t.Fatalf("Failed to insert parent: %v", err)
+	}
+
+	// Test 1: Valid foreign key should work
+	_, err = db.ExecContext(ctx, "INSERT INTO child (id, parent_id, name) VALUES (1, 1, 'Child 1')")
+	if err != nil {
+		t.Fatalf("Valid foreign key insert failed: %v", err)
+	}
+
+	// Test 2: Invalid foreign key should fail
+	_, err = db.ExecContext(ctx, "INSERT INTO child (id, parent_id, name) VALUES (2, 999, 'Child 2')")
+	if err == nil {
+		t.Error("Expected foreign key constraint violation, but insert succeeded")
+	} else if !contains(err.Error(), "FOREIGN KEY constraint failed") {
+		t.Errorf("Expected foreign key constraint error, got: %v", err)
+	} else {
+		t.Logf("✓ Foreign key constraint correctly enforced: %v", err)
+	}
+
+	// Test 3: Deleting referenced parent should fail
+	_, err = db.ExecContext(ctx, "DELETE FROM parent WHERE id = 1")
+	if err == nil {
+		t.Error("Expected foreign key constraint violation when deleting referenced parent")
+	} else if !contains(err.Error(), "FOREIGN KEY constraint failed") {
+		t.Errorf("Expected foreign key constraint error on delete, got: %v", err)
+	} else {
+		t.Logf("✓ Foreign key constraint correctly prevented parent deletion: %v", err)
+	}
+}
+
+// TestJournalModeValidation verifies that the journal_mode setting is applied correctly.
+func TestJournalModeValidation(t *testing.T) {
+	modes := []struct {
+		mode     JournalMode
+		expected string
+	}{
+		{JournalModeWAL, "wal"},
+		{JournalModeDelete, "delete"},
+		{JournalModeTruncate, "truncate"},
+		{JournalModeMemory, "memory"},
+	}
+
+	for _, tt := range modes {
+		t.Run(string(tt.mode), func(t *testing.T) {
+			tempDir := t.TempDir()
+
+			dbPath := filepath.Join(tempDir, "journal_test.db")
+			config := &Config{
+				Path:        dbPath,
+				JournalMode: tt.mode,
+				ForeignKeys: true,
+			}
+
+			url, err := config.ToURL()
+			if err != nil {
+				t.Fatalf("Failed to generate URL: %v", err)
+			}
+
+			db, err := sql.Open("sqlite", url)
+			if err != nil {
+				t.Fatalf("Failed to open database: %v", err)
+			}
+			defer db.Close()
+
+			var actualMode string
+
+			err = db.QueryRowContext(context.Background(), "PRAGMA journal_mode").Scan(&actualMode)
+			if err != nil {
+				t.Fatalf("Failed to query journal_mode: %v", err)
+			}
+
+			if actualMode != tt.expected {
+				t.Errorf("journal_mode: expected %q, got %q", tt.expected, actualMode)
+			} else {
+				t.Logf("✓ journal_mode correctly set to: %s", actualMode)
+			}
+		})
+	}
+}
+
+// contains checks if a string contains a substring (helper function).
+func contains(str, substr string) bool {
+	return strings.Contains(str, substr)
+}
+
+// TestToURLOpensExactPath guards against URI metacharacters in the path: SQLite
+// ends a file: URI path at '?' or '#' and decodes '%', so an unescaped path
+// opens a different file than the one configured.
+func TestToURLOpensExactPath(t *testing.T) {
+	for _, name := range []string{"q?x", "h#00", "pct%41", "pct%zz", "sp ace"} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), name)
+			require.NoError(t, os.Mkdir(dir, 0o700))
+
+			dbPath := filepath.Join(dir, name+".db")
+
+			url, err := Default(dbPath).ToURL()
+			require.NoError(t, err)
+
+			db, err := sql.Open("sqlite", url)
+			require.NoError(t, err)
+
+			defer db.Close()
+
+			_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id INTEGER)")
+			require.NoError(t, err)
+
+			_, err = os.Stat(dbPath)
+			require.NoError(t, err, "database not created at configured path")
+
+			var mode string
+			require.NoError(t, db.QueryRowContext(t.Context(), "PRAGMA journal_mode").Scan(&mode))
+			require.Equal(t, "wal", mode)
+
+			// The read-only form tailsql uses must open the same file.
+			roURL, err := (&Config{Path: dbPath, WALAutocheckpoint: -1, ReadOnly: true}).ToURL()
+			require.NoError(t, err)
+
+			ro, err := sql.Open("sqlite", roURL)
+			require.NoError(t, err)
+
+			defer ro.Close()
+
+			var n int
+			require.NoError(t, ro.QueryRowContext(t.Context(), "SELECT count(*) FROM t").Scan(&n))
+
+			_, err = ro.ExecContext(t.Context(), "INSERT INTO t VALUES (1)")
+			require.ErrorContains(t, err, "readonly")
+		})
+	}
+}
+
+// TestReadOnlyRejectsWrites proves a ReadOnly connection cannot change the
+// database, even when a statement lifts query_only. ATTACH and VACUUM INTO
+// still create other files; see [ReadOnly].
+func TestReadOnlyRejectsWrites(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ro.db")
+
+	rwURL, err := Default(dbPath).ToURL()
+	if err != nil {
+		t.Fatalf("rw url: %v", err)
+	}
+
+	rw, err := sql.Open("sqlite", rwURL)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	_, err = rw.ExecContext(ctx, "CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1)")
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	roURL, err := ReadOnly(dbPath).ToURL()
+	if err != nil {
+		t.Fatalf("ro url: %v", err)
+	}
+
+	ro, err := sql.Open("sqlite", roURL)
+	if err != nil {
+		t.Fatalf("open ro: %v", err)
+	}
+	defer ro.Close()
+
+	// One connection, so a PRAGMA in one statement carries to the next.
+	conn, err := ro.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer conn.Close()
+
+	writes := []string{
+		"INSERT INTO t VALUES (2)",
+		"UPDATE t SET v = 3",
+		"DELETE FROM t",
+		"DROP TABLE t",
+		"CREATE TABLE x (a)",
+		"PRAGMA query_only = 0; DELETE FROM t",
+		"DELETE FROM t",
+	}
+	for _, q := range writes {
+		_, err := conn.ExecContext(ctx, q)
+		if err == nil {
+			t.Errorf("%q succeeded on a read-only connection", q)
+		}
+	}
+
+	var n int
+
+	err = conn.QueryRowContext(ctx, "SELECT count(*) FROM t WHERE v = 1").Scan(&n)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if n != 1 {
+		t.Errorf("table changed: %d rows with v=1, want 1", n)
+	}
+}

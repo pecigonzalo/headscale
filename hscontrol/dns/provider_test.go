@@ -1,0 +1,551 @@
+package dns
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	gigahost "github.com/kradalby/libdns-gigahost"
+	"github.com/libdns/acmedns"
+	"github.com/libdns/cloudflare"
+	"github.com/libdns/hetzner/v2"
+	"github.com/libdns/libdns"
+	"github.com/libdns/powerdns"
+	"github.com/libdns/rfc2136"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func noEnv(string) (any, bool) { return nil, false }
+
+// readSecret stands in for the caller's file: resolver.
+func readSecret(_, value string) (string, error) {
+	path, ok := strings.CutPrefix(value, "file:")
+	if !ok {
+		return value, nil
+	}
+
+	b, err := os.ReadFile(path)
+
+	return strings.TrimSpace(string(b)), err
+}
+
+func TestIsProviderSetting(t *testing.T) {
+	assert.True(t, IsProviderSetting("api_token"))
+	assert.True(t, IsProviderSetting("config"))
+	assert.True(t, IsProviderSetting("fulldomain"), "a registration setting")
+	assert.True(t, IsProviderSetting("API_Token"), "matched as the decoder matches")
+	assert.True(t, IsProviderMapSetting("config"))
+	assert.False(t, IsProviderMapSetting("api_token"))
+	assert.False(t, IsProviderSetting("api_token_path"))
+}
+
+func TestSettingNames(t *testing.T) {
+	assert.Subset(t, SettingNames("cloudflare"), []string{"api_token", "zone_token"})
+	assert.Subset(t, SettingNames("CloudFlare"), []string{"api_token"}, "named as NewProvider names it")
+	assert.Nil(t, SettingNames("route53"))
+	assert.Nil(t, SettingNames(""))
+}
+
+// The unread placeholder settingFromFile returns is a map, so checks
+// without the files decode only while every setting is a string or a map.
+func TestProviderSettingKinds(t *testing.T) {
+	for name, entry := range providers {
+		for tag, kind := range jsonFields(entry.build()) {
+			assert.Contains(t, []reflect.Kind{reflect.String, reflect.Map}, kind, "%s %s", name, tag)
+		}
+	}
+}
+
+// unreadSecret stands in for a caller that checks without reading files.
+func unreadSecret(_, value string) (string, error) {
+	if strings.HasPrefix(value, "file:") {
+		return value, ErrSecretUnread
+	}
+
+	return value, nil
+}
+
+// TestNewProviderUnreadSecrets pins that a check without the files skips
+// only what needs their contents.
+func TestNewProviderUnreadSecrets(t *testing.T) {
+	account := func(serverURL string) map[string]any {
+		return map[string]any{"username": "user", "password": "file:/pass", "subdomain": "reg", "server_url": serverURL}
+	}
+
+	tests := []struct {
+		name     string
+		settings map[string]any
+		wantErr  bool
+	}{
+		{name: "server_url from file", settings: account("file:/url")},
+		{name: "registration server_url from file", settings: map[string]any{"config": map[string]any{"laptop.example.com": account("file:/url")}}},
+		{name: "literal server_url still checked", settings: account("auth.acme-dns.io"), wantErr: true},
+		{name: "literal registration server_url still checked", settings: map[string]any{"config": map[string]any{"laptop.example.com": account("auth.acme-dns.io")}}, wantErr: true},
+		{name: "registrations from file", settings: map[string]any{"config": "file:/acmedns.json"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewProvider("acmedns", tt.settings, noEnv, unreadSecret)
+			if tt.wantErr {
+				require.ErrorIs(t, err, ErrProviderConfig)
+
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestNewProvider(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(secret, []byte("from-file\n"), 0o600))
+
+	// The registrations' JSON, its password a file: secret as if written inline.
+	regs := filepath.Join(t.TempDir(), "acmedns.json")
+	require.NoError(t, os.WriteFile(regs, []byte(`{"node.ts.example.com": {"username": "user", "password": "file:`+secret+
+		`", "subdomain": "reg", "server_url": "https://auth.acme-dns.io"}}`+"\n"), 0o600))
+
+	// json's error would quote the number.
+	notJSON := filepath.Join(t.TempDir(), "acmedns.json")
+	require.NoError(t, os.WriteFile(notJSON, []byte("1e1000\n"), 0o600))
+
+	tests := []struct {
+		name     string
+		provider string
+		settings map[string]any
+		want     Provider
+		wantErr  error
+	}{
+		{
+			name:     "cloudflare from settings",
+			provider: "cloudflare",
+			settings: map[string]any{"name": "cloudflare", "api_token": "tok"},
+			want:     &cloudflare.Provider{APIToken: "tok"},
+		},
+		{
+			name:     "name is case insensitive",
+			provider: "CloudFlare",
+			settings: map[string]any{"api_token": "tok"},
+			want:     &cloudflare.Provider{APIToken: "tok"},
+		},
+		{
+			name:     "rfc2136",
+			provider: "rfc2136",
+			settings: map[string]any{
+				"server":   "ns1.example.com:53",
+				"key_name": "headscale",
+				"key_alg":  "hmac-sha256",
+				"key":      "c2VjcmV0",
+			},
+			want: &rfc2136.Provider{
+				Server:  "ns1.example.com:53",
+				KeyName: "headscale",
+				KeyAlg:  "hmac-sha256",
+				Key:     "c2VjcmV0",
+			},
+		},
+		{
+			name:     "secret from file",
+			provider: "cloudflare",
+			settings: map[string]any{"api_token": "file:" + secret},
+			want:     &cloudflare.Provider{APIToken: "from-file"},
+		},
+		{
+			name:     "path key is unknown",
+			provider: "cloudflare",
+			settings: map[string]any{"api_token_path": secret},
+			wantErr:  ErrProviderConfig,
+		},
+		{
+			name:     "unreadable file",
+			provider: "cloudflare",
+			settings: map[string]any{"api_token": "file:" + filepath.Join(t.TempDir(), "missing")},
+			wantErr:  ErrProviderConfig,
+		},
+		{
+			name:     "unknown key",
+			provider: "cloudflare",
+			settings: map[string]any{"auth_token": "tok"},
+			wantErr:  ErrProviderConfig,
+		},
+		{
+			name:     "unknown provider",
+			provider: "route53",
+			wantErr:  ErrUnknownProvider,
+		},
+		{
+			name:     "gigahost",
+			provider: "gigahost",
+			settings: map[string]any{"api_key": "file:" + secret},
+			want:     &gigahost.Provider{APIKey: "from-file"},
+		},
+		{
+			name:     "hetzner",
+			provider: "hetzner",
+			settings: map[string]any{"api_token": "file:" + secret},
+			want:     &hetzner.Provider{APIToken: "from-file"},
+		},
+		{
+			name:     "powerdns",
+			provider: "powerdns",
+			settings: map[string]any{"server_url": "https://pdns.example.com", "api_token": "tok"},
+			want:     &powerdns.Provider{ServerURL: "https://pdns.example.com", APIToken: "tok"},
+		},
+		{
+			name:     "acmedns",
+			provider: "acmedns",
+			settings: map[string]any{
+				"username":   "user",
+				"password":   "file:" + secret,
+				"subdomain":  "reg",
+				"server_url": "https://auth.acme-dns.io",
+			},
+			want: &acmeDNS{
+				Username:  "user",
+				Password:  "from-file",
+				Subdomain: "reg",
+				ServerURL: "https://auth.acme-dns.io",
+				served:    map[string][2]acmeDNSValue{},
+			},
+		},
+		{
+			name:     "acmedns per domain",
+			provider: "acmedns",
+			settings: map[string]any{"config": map[string]any{
+				"node.ts.example.com": map[string]any{
+					"username":   "user",
+					"password":   "pass",
+					"subdomain":  "reg",
+					"server_url": "https://auth.acme-dns.io",
+				},
+			}},
+			want: &acmeDNS{
+				Configs: map[string]acmedns.DomainConfig{
+					"node.ts.example.com": {
+						Username:  "user",
+						Password:  "pass",
+						Subdomain: "reg",
+						ServerURL: "https://auth.acme-dns.io",
+					},
+				},
+				served: map[string][2]acmeDNSValue{},
+			},
+		},
+		{
+			name:     "acmedns per domain from file",
+			provider: "acmedns",
+			settings: map[string]any{"config": map[string]any{
+				"node.ts.example.com": map[string]any{
+					"username":   "user",
+					"password":   "file:" + secret,
+					"subdomain":  "reg",
+					"server_url": "https://auth.acme-dns.io",
+				},
+			}},
+			want: &acmeDNS{
+				Configs: map[string]acmedns.DomainConfig{
+					"node.ts.example.com": {
+						Username:  "user",
+						Password:  "from-file",
+						Subdomain: "reg",
+						ServerURL: "https://auth.acme-dns.io",
+					},
+				},
+				served: map[string][2]acmeDNSValue{},
+			},
+		},
+		{
+			name:     "acmedns per domain file missing",
+			provider: "acmedns",
+			settings: map[string]any{"config": map[string]any{
+				"node.ts.example.com": map[string]any{
+					"username":   "user",
+					"password":   "file:" + filepath.Join(t.TempDir(), "missing"),
+					"subdomain":  "reg",
+					"server_url": "https://auth.acme-dns.io",
+				},
+			}},
+			wantErr: ErrProviderConfig,
+		},
+		{
+			name:     "acmedns registrations from file",
+			provider: "acmedns",
+			settings: map[string]any{"config": "file:" + regs},
+			want: &acmeDNS{
+				Configs: map[string]acmedns.DomainConfig{
+					"node.ts.example.com": {
+						Username:  "user",
+						Password:  "from-file",
+						Subdomain: "reg",
+						ServerURL: "https://auth.acme-dns.io",
+					},
+				},
+				configFile: "dns.challenge.provider.config: " + regs,
+				served:     map[string][2]acmeDNSValue{},
+			},
+		},
+		{
+			name:     "acmedns registrations file missing",
+			provider: "acmedns",
+			settings: map[string]any{"config": "file:" + filepath.Join(t.TempDir(), "missing")},
+			wantErr:  ErrProviderConfig,
+		},
+		{
+			name:     "acmedns registrations file not JSON",
+			provider: "acmedns",
+			settings: map[string]any{"config": "file:" + notJSON},
+			wantErr:  ErrProviderConfig,
+		},
+		{
+			name:     "acmedns server_url without scheme",
+			provider: "acmedns",
+			settings: map[string]any{
+				"username":   "user",
+				"password":   "pass",
+				"subdomain":  "reg",
+				"server_url": "auth.acme-dns.io",
+			},
+			wantErr: ErrProviderConfig,
+		},
+		{
+			name:     "acmedns without subdomain",
+			provider: "acmedns",
+			settings: map[string]any{
+				"username":   "user",
+				"password":   "pass",
+				"server_url": "https://auth.acme-dns.io",
+			},
+			wantErr: ErrProviderConfig,
+		},
+		{
+			name:     "only a name",
+			provider: "gigahost",
+			settings: map[string]any{"name": "gigahost"},
+			wantErr:  ErrProviderConfig,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewProvider(tt.provider, tt.settings, noEnv, readSecret)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.NotContains(t, err.Error(), "1e1000", "a file's contents are secret")
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// fakeAcmeDNS is an acme-dns server with one registration, reg. It has two
+// rows, and an update overwrites the one stamped with the earlier second.
+// acme-dns overwrites either on a tie; the fake picks the one written
+// later, which a writer assuming first in, first out gets wrong.
+type fakeAcmeDNS struct {
+	*httptest.Server
+
+	mu     sync.Mutex
+	writes int
+	rows   [2]fakeAcmeDNSRow
+}
+
+type fakeAcmeDNSRow struct {
+	txt   string
+	stamp int64 // acme-dns's LastUpdate, in whole seconds
+	write int   // the order of writes, which acme-dns does not keep
+}
+
+func newFakeAcmeDNS(t *testing.T) *fakeAcmeDNS {
+	t.Helper()
+
+	f := &fakeAcmeDNS{}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var update struct{ Subdomain, Txt string }
+
+		err := json.NewDecoder(r.Body).Decode(&update)
+		if r.URL.Path != "/update" || err != nil || update.Subdomain != "reg" || r.Header.Get("X-Api-User") != "user" {
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		i := 0
+		if f.rows[1].stamp < f.rows[0].stamp ||
+			(f.rows[1].stamp == f.rows[0].stamp && f.rows[1].write > f.rows[0].write) {
+			i = 1
+		}
+
+		f.writes++
+		f.rows[i] = fakeAcmeDNSRow{txt: update.Txt, stamp: time.Now().Unix(), write: f.writes}
+	}))
+	t.Cleanup(f.Close)
+
+	return f
+}
+
+func (f *fakeAcmeDNS) registration() map[string]any {
+	return map[string]any{
+		"username":   "user",
+		"password":   "pass",
+		"subdomain":  "reg",
+		"server_url": f.URL,
+	}
+}
+
+func (f *fakeAcmeDNS) serving() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var txts []string
+
+	for _, row := range f.rows {
+		if row.txt != "" {
+			txts = append(txts, row.txt)
+		}
+	}
+
+	return txts
+}
+
+func acmeTXT(node, value string) []libdns.Record {
+	return []libdns.Record{libdns.TXT{Name: "_acme-challenge." + node, Text: value}}
+}
+
+// A registration serves the two values written last, and deleting is a
+// no-op: an update overwrites the older value even if a CA may still be
+// validating it, however many values were deleted. Two updates within one
+// second carry the same stamp, leaving acme-dns free to overwrite either:
+// after a then b, with a freed, c could overwrite b.
+// Runtime errors reach the server log: they name registrations written
+// inline, but only the file that holds them otherwise.
+func TestAcmeDNSRuntimeErrorsFromFile(t *testing.T) {
+	t.Parallel()
+
+	// Refuses connections, so an update fails in transport, quoting its URL.
+	closed := httptest.NewServer(nil)
+	closed.Close()
+
+	regs := map[string]any{"node.ts.example.com": map[string]any{
+		"username":   "user",
+		"password":   "pass",
+		"subdomain":  "marker-subdomain",
+		"server_url": closed.URL + "/marker-url",
+	}}
+
+	b, err := json.Marshal(regs)
+	require.NoError(t, err)
+
+	file := filepath.Join(t.TempDir(), "acmedns.json")
+	require.NoError(t, os.WriteFile(file, b, 0o600))
+
+	for name, config := range map[string]any{"inline": regs, "file": "file:" + file} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			named := func(err error, marker string) {
+				t.Helper()
+
+				if name == "inline" {
+					assert.Contains(t, err.Error(), marker)
+				} else {
+					assert.NotContains(t, err.Error(), "marker-")
+					assert.Contains(t, err.Error(), "dns.challenge.provider.config: "+file)
+				}
+			}
+
+			p, err := NewProvider("acmedns", map[string]any{"config": config}, noEnv, readSecret)
+			require.NoError(t, err)
+
+			ctx := context.Background()
+
+			_, err = p.AppendRecords(ctx, testZone, acmeTXT("node", "value"))
+			require.Error(t, err)
+
+			_, isURL := errors.AsType[*url.Error](err)
+			assert.True(t, isURL, "a transport failure keeps its type")
+			named(err, "marker-url")
+
+			a, ok := p.(*acmeDNS)
+			require.True(t, ok)
+
+			// Both values the registration serves are in use.
+			a.served["marker-subdomain"] = [2]acmeDNSValue{{live: true}, {live: true}}
+
+			_, err = p.AppendRecords(ctx, testZone, acmeTXT("node", "value"))
+			require.ErrorIs(t, err, ErrTooManyChallenges)
+			named(err, "marker-subdomain")
+		})
+	}
+}
+
+func TestAcmeDNSRefusesEviction(t *testing.T) {
+	t.Parallel()
+
+	srv := newFakeAcmeDNS(t)
+
+	p, err := NewProvider("acmedns", srv.registration(), noEnv, readSecret)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	a, err := p.AppendRecords(ctx, testZone, acmeTXT("a", "value-a"))
+	require.NoError(t, err)
+	require.Len(t, a, 1, "certmagic needs the appended record back")
+
+	b, err := p.AppendRecords(ctx, testZone, acmeTXT("b", "value-b"))
+	require.NoError(t, err)
+
+	_, err = p.AppendRecords(ctx, testZone, acmeTXT("c", "value-c"))
+	require.ErrorIs(t, err, ErrTooManyChallenges)
+
+	// The newer value is free, but an update overwrites the older one.
+	_, err = p.DeleteRecords(ctx, testZone, b)
+	require.NoError(t, err)
+
+	_, err = p.AppendRecords(ctx, testZone, acmeTXT("c", "value-c"))
+	require.ErrorIs(t, err, ErrTooManyChallenges)
+	assert.ElementsMatch(t, []string{"value-a", "value-b"}, srv.serving(), "a refused value reached acme-dns")
+
+	_, err = p.DeleteRecords(ctx, testZone, a)
+	require.NoError(t, err)
+
+	c, err := p.AppendRecords(ctx, testZone, acmeTXT("c", "value-c"))
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"value-b", "value-c"}, srv.serving())
+
+	// b is free and now the older value; overwriting it leaves c alone.
+	_, err = p.AppendRecords(ctx, testZone, acmeTXT("d", "value-d"))
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"value-c", "value-d"}, srv.serving())
+
+	// Giving up while waiting to space updates writes nothing.
+	_, err = p.DeleteRecords(ctx, testZone, c)
+	require.NoError(t, err)
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err = p.AppendRecords(cancelled, testZone, acmeTXT("e", "value-e"))
+	require.ErrorIs(t, err, context.Canceled)
+	assert.ElementsMatch(t, []string{"value-c", "value-d"}, srv.serving())
+}

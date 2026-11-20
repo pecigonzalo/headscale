@@ -1,0 +1,3 @@
+{
+  "error": "Fatal config error: configuration key acl_policy_path was removed in 0.30 ($DIR/config.yaml:13:1)\n  hint: use policy.path\n\nFatal config error: unknown configuration key policy.type ($DIR/config.yaml:15:3)\n"
+}

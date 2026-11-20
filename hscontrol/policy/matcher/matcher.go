@@ -2,6 +2,8 @@ package matcher
 
 import (
 	"net/netip"
+	"slices"
+	"strings"
 
 	"github.com/juanfont/headscale/hscontrol/util"
 	"go4.org/netipx"
@@ -9,62 +11,181 @@ import (
 )
 
 type Match struct {
-	Srcs  *netipx.IPSet
-	Dests *netipx.IPSet
+	srcs  *netipx.IPSet
+	dests *netipx.IPSet
+
+	srcRanges  []netipx.IPRange
+	destRanges []netipx.IPRange
+
+	// Kept apart because only port destinations carry traffic to an exit
+	// node; a capability to the internet changes who the exit node lists.
+	internet    bool
+	capInternet bool
 }
 
+// newMatch unions the port and capability destinations into one set.
+func newMatch(srcs, ports, caps *netipx.IPSet) Match {
+	var b netipx.IPSetBuilder
+	b.AddSet(ports)
+	b.AddSet(caps)
+
+	dests, _ := b.IPSet()
+
+	return Match{
+		srcs:        srcs,
+		dests:       dests,
+		srcRanges:   srcs.Ranges(),
+		destRanges:  dests.Ranges(),
+		internet:    util.HasInternetDestination(ports),
+		capInternet: util.HasInternetDestination(caps),
+	}
+}
+
+func (m *Match) DebugString() string {
+	var sb strings.Builder
+
+	sb.WriteString("Match:\n")
+	sb.WriteString("  Sources:\n")
+
+	for _, prefix := range m.srcs.Prefixes() {
+		sb.WriteString("    " + prefix.String() + "\n")
+	}
+
+	sb.WriteString("  Destinations:\n")
+
+	for _, prefix := range m.dests.Prefixes() {
+		sb.WriteString("    " + prefix.String() + "\n")
+	}
+
+	return sb.String()
+}
+
+func MatchesFromFilterRules(rules []tailcfg.FilterRule) []Match {
+	matches := make([]Match, 0, len(rules))
+	for _, rule := range rules {
+		matches = append(matches, MatchFromFilterRule(rule))
+	}
+
+	return matches
+}
+
+// MatchFromFilterRule derives a [Match] from a [tailcfg.FilterRule]. The
+// destination IP set is the union of [tailcfg.FilterRule.DstPorts][].IP
+// and [tailcfg.FilterRule.CapGrant][].Dsts: cap-grant-only rules (e.g.
+// tailscale.com/cap/relay) carry their destinations in CapGrant.Dsts and
+// would otherwise contribute nothing to peer-visibility derivation in
+// [policy.ReduceNodes], hiding the cap target
+// from the source unless a companion IP-level rule also exists.
 func MatchFromFilterRule(rule tailcfg.FilterRule) Match {
-	dests := []string{}
-	for _, dest := range rule.DstPorts {
-		dests = append(dests, dest.IP)
-	}
-
-	return MatchFromStrings(rule.SrcIPs, dests)
+	return MatchFromFilterRuleSrcs(rule, buildIPSet(rule.SrcIPs))
 }
 
-func MatchFromStrings(sources, destinations []string) Match {
-	srcs := new(netipx.IPSetBuilder)
-	dests := new(netipx.IPSetBuilder)
+// MatchFromFilterRuleSrcs is [MatchFromFilterRule] for a rule whose SrcIPs
+// are already parsed as srcs, see [ParseSrcs]: rules sharing one source
+// list, such as a via grant's on every router, parse it once.
+func MatchFromFilterRuleSrcs(rule tailcfg.FilterRule, srcs *netipx.IPSet) Match {
+	var ports, caps netipx.IPSetBuilder
 
-	for _, srcIP := range sources {
-		set, _ := util.ParseIPSet(srcIP, nil)
-
-		srcs.AddSet(set)
+	for _, dp := range rule.DstPorts {
+		set, _ := util.ParseIPSet(dp.IP, nil)
+		ports.AddSet(set)
 	}
 
-	for _, dest := range destinations {
-		set, _ := util.ParseIPSet(dest, nil)
-
-		dests.AddSet(set)
-	}
-
-	srcsSet, _ := srcs.IPSet()
-	destsSet, _ := dests.IPSet()
-
-	match := Match{
-		Srcs:  srcsSet,
-		Dests: destsSet,
-	}
-
-	return match
-}
-
-func (m *Match) SrcsContainsIPs(ips []netip.Addr) bool {
-	for _, ip := range ips {
-		if m.Srcs.Contains(ip) {
-			return true
+	for _, cg := range rule.CapGrant {
+		for _, pref := range cg.Dsts {
+			caps.AddPrefix(pref)
 		}
 	}
 
-	return false
+	portsSet, _ := ports.IPSet()
+	capsSet, _ := caps.IPSet()
+
+	return newMatch(srcs, portsSet, capsSet)
 }
 
-func (m *Match) DestsContainsIP(ips []netip.Addr) bool {
-	for _, ip := range ips {
-		if m.Dests.Contains(ip) {
-			return true
-		}
+// ParseSrcs parses SrcIPs as [MatchFromFilterRule] does.
+func ParseSrcs(srcIPs []string) *netipx.IPSet {
+	return buildIPSet(srcIPs)
+}
+
+// buildIPSet parses each string via [util.ParseIPSet] and unions the
+// results into a single [netipx.IPSet]. Unparseable entries are silently
+// dropped (fail-open): the result is narrower than the input described,
+// but never wider.
+func buildIPSet(addrs []string) *netipx.IPSet {
+	builder := new(netipx.IPSetBuilder)
+
+	for _, addr := range addrs {
+		set, _ := util.ParseIPSet(addr, nil)
+		builder.AddSet(set)
 	}
 
-	return false
+	set, _ := builder.IPSet()
+
+	return set
+}
+
+func (m *Match) SrcsContainsIPs(ips ...netip.Addr) bool {
+	return slices.ContainsFunc(ips, m.srcs.Contains)
+}
+
+func (m *Match) DestsContainsIP(ips ...netip.Addr) bool {
+	return slices.ContainsFunc(ips, m.dests.Contains)
+}
+
+func (m *Match) SrcsOverlapsPrefixes(prefixes ...netip.Prefix) bool {
+	return slices.ContainsFunc(prefixes, func(prefix netip.Prefix) bool {
+		return overlaps(m.srcRanges, netipx.RangeOfPrefix(prefix))
+	})
+}
+
+func (m *Match) DestsOverlapsPrefixes(prefixes ...netip.Prefix) bool {
+	return slices.ContainsFunc(prefixes, func(prefix netip.Prefix) bool {
+		return overlaps(m.destRanges, netipx.RangeOfPrefix(prefix))
+	})
+}
+
+// SrcsOverlapsRanges reports whether the sources overlap sorted, disjoint ranges.
+func (m *Match) SrcsOverlapsRanges(ranges []netipx.IPRange) bool {
+	return rangesOverlap(m.srcRanges, ranges)
+}
+
+// DestsOverlapsRanges reports whether the destinations overlap sorted, disjoint ranges.
+func (m *Match) DestsOverlapsRanges(ranges []netipx.IPRange) bool {
+	return rangesOverlap(m.destRanges, ranges)
+}
+
+func rangesOverlap(a, b []netipx.IPRange) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+
+	return slices.ContainsFunc(a, func(r netipx.IPRange) bool {
+		return overlaps(b, r)
+	})
+}
+
+func overlaps(ranges []netipx.IPRange, r netipx.IPRange) bool {
+	if !r.IsValid() {
+		return false
+	}
+
+	i, _ := slices.BinarySearchFunc(ranges, r.From(),
+		func(x netipx.IPRange, a netip.Addr) int {
+			return x.To().Compare(a)
+		})
+
+	return i < len(ranges) && ranges[i].Overlaps(r)
+}
+
+// DestsIsTheInternet reports whether any port destination is in
+// [util.TheInternet]. It lets clients select exit nodes for that traffic.
+func (m *Match) DestsIsTheInternet() bool {
+	return m.internet
+}
+
+// CapDestsIsTheInternet reports whether any capability destination is in
+// [util.TheInternet].
+func (m *Match) CapDestsIsTheInternet() bool {
+	return m.capInternet
 }

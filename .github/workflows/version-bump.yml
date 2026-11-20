@@ -1,0 +1,128 @@
+name: Version Bump
+
+# Deliberately not a pull_request workflow. Running on the default branch is
+# what makes the gate cheap: a default-branch job's binary-cache writes are
+# readable by every later pull request job, so the nix checks run here are the
+# same derivations nix-checks.yml then gets as cache hits. See gc.yml for the
+# scoping rule.
+#
+# The schedule only ever fires upstream: the job guard below falls through to
+# the repository check for anything that is not a manual dispatch, and GitHub
+# does not run schedules in forks to begin with.
+on:
+  schedule:
+    # Early enough that a pull request opened here has its checks done by the
+    # time anyone looks, and far from the hours the integration matrix is
+    # usually busy.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Apply and report, but run no final gate and touch no remote"
+        type: boolean
+        default: false
+      areas:
+        description: "Comma-separated areas to run (default: all)"
+        type: string
+        default: ""
+      gate:
+        description: "Final gate level"
+        type: choice
+        options: [full, quick, none]
+        default: full
+      force:
+        description: "Open a pull request even if an identical one was closed unmerged"
+        type: boolean
+        default: false
+
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # The run's pull request lookup and its rebase-conflict comment.
+  pull-requests: write
+
+jobs:
+  bump:
+    # A manual dispatch is safe anywhere: the job cannot publish without the
+    # bot App's key, which a fork only has if its owner deliberately added
+    # one. That is what makes the whole thing testable on a fork before it is
+    # trusted here. A schedule, when one is added, stays upstream-only.
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'juanfont/headscale'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: nix develop --fallback --command bash -e {0}
+    steps:
+      # No persisted credentials: the push authenticates through gh, with
+      # whichever token the step holds.
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: NixOS/nix-installer-action@v1.0.0
+      - uses: Mic92/hestia@v3.1.0
+
+      - name: Configure the committer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # There is no separate lock-update step: the tool rebuilds the branch from
+      # the base itself, so anything done before it would be discarded. The
+      # devShell above only supplies the Go that runs the tool; the tool
+      # re-enters `nix develop` per command, which is how the steps after the
+      # lock update see the toolchain that was just locked.
+      - name: Bump
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE: ${{ inputs.gate || 'full' }}
+          AREAS: ${{ inputs.areas }}
+          DRY_RUN: ${{ inputs.dry-run || false }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          # Built before the run moves HEAD, so Publish does not compile the
+          # freshly bumped dependencies.
+          go build -o "$RUNNER_TEMP/bump" ./tools/bump
+          "$RUNNER_TEMP/bump" run \
+            --gate="$GATE" \
+            --areas="$AREAS" \
+            --dry-run="$DRY_RUN" \
+            --force="$FORCE" \
+            --handoff="$RUNNER_TEMP/bump.json"
+          if [ -f "$RUNNER_TEMP/bump.json" ]; then
+            echo "handoff=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Minted after the gate: the token expires within an hour, a gate can run
+      # longer, and the gate builds freshly bumped dependencies that should not
+      # hold a token that writes. The bot App's token, not GITHUB_TOKEN: checks
+      # on a pull request opened by GITHUB_TOKEN wait for a maintainer's
+      # approval, which is exactly how the previous flake.lock bot ended up
+      # shipping untested changes. Not a maintainer's PAT either: that opens
+      # the pull request as them, and they cannot approve their own. Workflows
+      # write is for the action pin sweep.
+      # shortcut: the gate shares this runner, so code it runs could still
+      # tamper with the binary or .git; a separate publish job would isolate it.
+      - uses: actions/create-github-app-token@v3.3.0
+        if: steps.bump.outputs.handoff == 'true'
+        id: app
+        with:
+          client-id: ${{ vars.HEADSCALE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.HEADSCALE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Publish
+        if: steps.bump.outputs.handoff == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh auth setup-git
+          "$RUNNER_TEMP/bump" publish --handoff="$RUNNER_TEMP/bump.json"

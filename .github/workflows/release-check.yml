@@ -1,0 +1,36 @@
+name: Release checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: nix develop --fallback --command bash -e {0}
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: NixOS/nix-installer-action@v1.0.0
+      - uses: Mic92/hestia@v3.1.0
+      - name: Validate release configuration
+        run: goreleaser check
+      - name: Test release guards
+        run: bash tools/release-check-test.sh
+      - name: Build and verify Headscale release binary
+        run: goreleaser build --snapshot --clean --single-target

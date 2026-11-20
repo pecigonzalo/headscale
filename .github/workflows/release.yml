@@ -7,19 +7,43 @@ on:
       - "*" # triggers only if push new tag version
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: nix develop --fallback --command bash -e {0}
+
 jobs:
   goreleaser:
+    if: github.repository == 'juanfont/headscale'
     runs-on: ubuntu-latest
+    permissions:
+      # The GitHub release.
+      contents: write
+      # ko pushes to ghcr.io.
+      packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Login to DockerHub
+        uses: docker/login-action@v4.8.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: NixOS/nix-installer-action@v1.0.0
+      - uses: Mic92/hestia@v3.1.0
 
       - name: Run goreleaser
-        run: nix develop --command -- goreleaser release --clean
+        run: goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

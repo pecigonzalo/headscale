@@ -1,0 +1,3 @@
+{
+  "error": "Fatal config error: configuration key tuning.notifier_send_timeout was removed in 0.30 ($DIR/config.yaml:18:3)\n  hint: remove it: it had no effect\n"
+}
